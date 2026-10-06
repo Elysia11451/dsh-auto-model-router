@@ -1,0 +1,42 @@
+{
+  "name": "dsh-auto-model-router",
+  "version": "0.7.0",
+  "description": "一个按会话来源自动切换模型与推理档位的 DSH 插件：IM 聊天走省 token 模型，Agent 工作走 our-free-model 最强模型最高档。",
+  "license": "MIT",
+  "type": "module",
+  "main": "./src/index.js",
+  "files": [
+    "src/index.js",
+    "src/router.js",
+    "src/leaderboard.js",
+    "cordis.patch.yml",
+    "README.md",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "model-router",
+    "reasoning-effort",
+    "mobile"
+  ],
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh": ">=0.2.0-rc.1",
+    "dsh-our-free-model": ">=1.4.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "test": "node test/router.test.mjs && node test/crash.test.mjs && node test/leaderboard.test.mjs"
+  }
+}

@@ -1,0 +1,18 @@
+- insert:
+    - id: auto-model-router
+      name: 'dsh-auto-model-router'
+      config:
+        chatProvider: zai-coding-cn
+        chatModel: glm-5.3-flash
+        chatEffort: 'light'
+        workProvider: our-free-model
+        workModel: mimo-v2.6-flash-free
+        workEffort: deep
+        workEffortOwned: deep
+        privateChatWorkStrategy: free
+        workModelFallback: mimo-v2.6-flash-free
+        hintCooldownMs: 300000
+        enableDynamicRanking: true
+        reclaimUnknownModel: true
+        manualWorkModel: ''
+        manualWorkModelLocked: false

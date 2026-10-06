@@ -1,0 +1,6 @@
+node_modules/
+.cache/
+*.log
+test-output.tmp
+final-test.tmp
+dump.tmp.yml
