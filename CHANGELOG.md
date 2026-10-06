@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.7.2] - 2026-10-07
+
+### Added
+- Session state machine replaces keyword-based classification (nextSessionMode pure function)
+- session-mode.js storage layer: hot Map + cold sidecar file + mode-changed event
+- tools/pre-execute tool-call upgrade signal (chat → work)
+- agent/pre-step idle-3-turns downgrade counter (work → chat)
+- keyword-upgrade pre-judgment for first-round work intent detection
+- Observation-tool exclusion list (run_code, send_meme) to prevent debug-tool pollution
+- Direction-aware reason strings: keyword-upgrade / tool-call / idle-3-turns / chat-turn-count
+
+### Changed
+- effKw restored to pass through kwHit for chat-state keyword upgrade
+- Chat target now follows owned API default when chatModel is empty
+
+### Fixed
+- Downgrade counter no longer reset by AI debug tool calls
+- isHumanInput() filters auto-continue retry messages from routing
+
 ## 0.7.1 — 2026-10-06
 
 系统重试消息过滤（isHumanInput，commit 99d2be0）：
