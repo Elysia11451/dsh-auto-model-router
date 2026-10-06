@@ -14,8 +14,10 @@
  *  - free-model 缺失时降级为纯日志模式，不抛错
  */
 import Schema from '@deepseek-ai/schemastery';
-import { decideRoute, sourceFromMeta, isGroupMeta, isSameKind, isWorkModelRef, buildGroupHint, normalizeEffortForSwitch, buildSelectModelPayload, resolveChatTarget, parseManualWorkLock, isColdStartCrossKind, isUnknownDrift, DEFAULTS } from './router.js';
+import { decideRoute, classifyTask, nextSessionMode, sourceFromMeta, isGroupMeta, isSameKind, isWorkModelRef, buildGroupHint, normalizeEffortForSwitch, buildSelectModelPayload, resolveChatTarget, parseManualWorkLock, isColdStartCrossKind, isUnknownDrift, DEFAULTS } from './router.js';
 import { rankIntersection, pickTop, fetchRankOrder, createLeaderboardCache, pickWorkModelFromChain, loadRankCache, saveRankCache, DEFAULT_WORK_MODEL, CACHE_TTL_MS, OR_URL } from './leaderboard.js';
+// v0.7.2 阶段二：会话状态存储层（热 Map + 冷侧车，升降档事件）。
+import { createSessionModeStore, MODE_CHANGED_EVENT } from './session-mode.js';
 // v0.5.0: node:os/node:path 静态导入已移除（移动端规范），DSH_HOME 解析改走动态导入，见 getDshHomeDir()。
 // v0.5.1: schemastery 改为静态真导入（规格红线：禁 stub/裸对象）。
 //   依赖解析：@deepseek-ai/schemastery + @standard-schema/spec + @deepseek-ai/cosmokit
@@ -154,6 +156,35 @@ export function apply(ctx, config = {}) {
   // 权威读回：exec.agent 上没有 model 字段（官方无此属性），用投影/缓存读。
   const lastSwitch = new Map(); // sessionId -> 'provider/model/effort'
   const SWITCH_COOLDOWN_MS = 60 * 1000; // 历史默认（现已被 cfg.switchCooldownMs 覆盖，默认 5000）
+
+  // ── v0.7.2 阶段二：会话状态存储层（热 Map + 冷侧车）──
+  // 热：Map<sid, {mode, chatTurns, updatedAt}>，>500 清最旧；冷：$DSH_HOME/plugin-state/ 侧车，
+  // 升降档即时写（fire-and-forget 失败静默）。升/降档事件落 auto-model-router/mode-changed
+  // 会话日志（参考 @morlay/dsh-session-mode：模式落成会话事实，恢复与 fork 据此重建）。
+  // 纪律：阶段二只做存储底座，不接钩子；状态机阶段三才参与路由。
+  const modeStore = createSessionModeStore({
+    homeDir: () => getDshHomeDir(),
+    onEvent: (ev) => {
+      try {
+        appendRouteLog({
+          sid: ev.sid,
+          tool: MODE_CHANGED_EVENT,
+          extractText: ev.reason ?? '',
+          task: '',
+          route: ev.mode,
+          target: null,
+          keepReason: ev.reason ?? null,
+          actualSel: null,
+          mode: ev.mode,
+          prevMode: ev.prevMode,
+          chatTurns: ev.chatTurns,
+        }).catch(() => {});
+        safeLog(ctx, 'info', 'session ' + ev.sid + ' mode ' + ev.prevMode + ' -> ' + ev.mode + ' (reason=' + (ev.reason ?? '-') + '; chatTurns=' + ev.chatTurns + '; event=' + MODE_CHANGED_EVENT + ').');
+      } catch { /* 诊断失败不阻断 */ }
+    },
+  });
+  // JSONL 诊断字段（mode/chatTurns）的同步读口：只读热 Map，绝不 IO。
+  const peekSessionMode = (sid) => { try { return modeStore.peek(sid); } catch { return null; } };
 
   // ── 动态工作模型（联网排行榜，1h 缓存；同步读、后台刷，绝不阻塞工具链）──
   // 数据源：OpenRouter ?sort=most-popular；交集 = our-free-model 当前可用清单。
@@ -297,6 +328,8 @@ export function apply(ctx, config = {}) {
   // 后台预热（apply 不 await）：先读文件缓存，再拉我方清单；榜单只在过期时打上游。
   Promise.resolve()
     .then(() => warmRankCache())
+    .then(() => modeStore.hydrate())
+    .then((n) => { if (n > 0) safeLog(ctx, 'info', 'session-mode sidecar loaded: ' + n + ' session(s).'); })
     .then(() => refreshFreeList())
     .then(() => { if (lb.isStale()) return refreshLeaderboard(); })
     .catch(() => {});
@@ -790,6 +823,8 @@ export function apply(ctx, config = {}) {
         // ── 安全阀：任何异常都放行，绝不阻断工具链 ──
         try {
           let text = '';
+          let isToolCall = false;
+          const execSid = (() => { try { return sidOf(exec); } catch { return 'unknown'; } })();
           try {
             const args = exec?.args ?? exec?.arguments;
             if (typeof args === 'string') text = args;
@@ -798,17 +833,35 @@ export function apply(ctx, config = {}) {
                 .filter((v) => typeof v === 'string').join('\n');
             }
             // 工具名直判（ToolExecution 实测形：exec.name + exec.arguments，无 .tool 字段）：
-            // write/edit/bash 等工具名本身就是"干活"证据 —— 哪怕自然语言已被压缩成“测试”二字，
+            // write/edit/bash/read 等工具名本身就是"干活"证据 —— 哪怕自然语言已被压缩成“测试”二字，
             // 工具调用仍是铁证。补一句"工具调用:<name>"，classifyTask 命中 AGENT_KEYWORDS 即判 work。
+            // v0.7.2 阶段三 3.1：同一正则同时产出升档信号 isToolCall（集合含 read）。
             try {
               const toolName = String(exec?.name ?? exec?.tool ?? '').trim();
-              if (toolName && /^(write|edit|bash|exec|run|create|update|delete|remove|move|copy|mkdir|install|deploy|publish|build|test|run_command|file|shell)$/i.test(toolName)) {
+              // v0.7.2 修正（turn 计数）：观测型/调试型工具不算工作信号。
+              // 参考 dsh-tool-turbo：简单确定性工具（write/read/grep/glob/bash 等）才算干活证据；
+              // web_search/web_fetch/browser/android 等信息获取类不自动算干活，避免闲聊查个天气就升 work。
+              const OBSERVATION_TOOLS = /^(run_code|send_meme|ask_user_question|read_image|present|compress|decompress|search_context|acp_status|acp_cache)$/i;
+              const isObservation = !!toolName && OBSERVATION_TOOLS.test(toolName);
+              isToolCall = !!toolName && !isObservation && /^(write|edit|bash|exec|run|create|update|delete|remove|move|copy|mkdir|install|deploy|publish|build|test|run_command|file|shell|read|grep|glob)$/i.test(toolName);
+              if (isToolCall) {
                 text += `\n工具调用:${toolName} 建文件 写代码 跑命令`;
               } else if (toolName) {
                 text += `\n工具调用:${toolName}`;
               }
             } catch { /* 工具名读取失败不影响文本分类 */ }
           } catch { text = ''; }
+
+          // ── v0.7.2 阶段三 3.1：真实工具调用 = "正在干活"的铁证 → 升 work + 计数清零 ──
+          // 为什么在 pre-step 拿不到这个信号：agent/pre-step 在消息进入时触发，此时工具还没调；
+          // tools/pre-execute 是工具执行前 waterfall，可见真实 exec.name。
+          // set() 内部即时写侧车 + 触发 mode-changed 事件（阶段二存储层）。
+          if (isToolCall && execSid && execSid !== 'unknown') {
+            // v0.7.2 修正（turn 计数）：升档不清零 chatTurns（避免同 turn 内多次工具调用反复清零）；
+            // 只置 tool 标记，真正的清零由 pre-step 在下一轮真人消息时按 turn 结算。
+            const cur = modeStore.peek(execSid);
+            modeStore.set(execSid, { mode: 'work', chatTurns: cur?.chatTurns ?? 0, reason: 'tool-call', tool: true });
+          }
 
           let meta = {};
           try {
@@ -820,9 +873,13 @@ export function apply(ctx, config = {}) {
             source = sourceFromMeta(meta);
           } catch { source = 'main'; }
 
+          // 3.3：task 由状态机给出（有状态时）；无状态退关键词兜底（升档 set 后必有状态，
+          // 纯注解轮/直调场景仍按文本分类）。
+          const st = (execSid && execSid !== 'unknown') ? await modeStore.read(execSid) : null;
+          const smTask = st ? (st.mode === 'work' ? 'agent-work' : 'chat') : null;
           let route;
           try {
-            route = decideRoute({ source, text, meta, currentMode: lastSwitch.get(sidOf(exec)) ? 'work' : null, strategy: cfg.privateChatWorkStrategy });
+            route = decideRoute({ source, text, meta, currentMode: lastSwitch.get(execSid) ? 'work' : null, strategy: cfg.privateChatWorkStrategy, task: smTask });
           } catch {
             return await next();
           }
@@ -834,6 +891,7 @@ export function apply(ctx, config = {}) {
           try {
             const __sid = sidOf(exec);
             const __target = exec?.autoModelRouter?.target ?? null;
+            const __ms = peekSessionMode(__sid); // v0.7.2 阶段二：状态机投影（热 Map，缺失 null）
             const __logEntry = {
               sid: __sid,
               tool: String(exec?.name ?? exec?.tool ?? ''),
@@ -843,49 +901,16 @@ export function apply(ctx, config = {}) {
               target: __target ? `${__target.provider}/${__target.model}/${__target.effort ?? '-'}` : null,
               keepReason: exec?.autoModelRouter?.keepReason ?? null,
               actualSel: null,
+              mode: __ms?.mode ?? null,
+              chatTurns: __ms?.chatTurns ?? null,
             };
             try { __logEntry.actualSel = readSelectionProjection(__sid); } catch { /* 读回失败留空 */ }
             appendRouteLog(__logEntry).catch(() => {});
           } catch { /* 诊断失败不阻断 */ }
-          // 真切（fire-and-forget，不阻塞工具链）：
-          //  - sessionId 直传：exec.agent.session ?? exec.sessionId，无转换
-          //  - 目标档位来自注解 target；失败自动降级为注解模式
-          try {
-            let target = exec?.autoModelRouter?.target;
-            const sid = sidOf(exec);
-            // 功能一（v0.5.1）：手动绝对优先 —— durable 在位先短路，再走精确同类判定
-            try {
-              if (target && sid && sid !== 'unknown') {
-                const keep = manualKeepReason(sid, null, route?.mode ?? '');
-                if (keep) {
-                  exec.autoModelRouter.target = null;
-                  exec.autoModelRouter.kept = readSelectionProjection(sid);
-                  exec.autoModelRouter.keepReason = keep;
-                  safeLog(ctx, 'info', `kept session ${sid} on ${exec.autoModelRouter.kept} (${keep}; routing skipped).`);
-                  target = null;
-                } else {
-                  const actual = readSelectionProjection(sid);
-                  if (shouldSwitch(actual, target) === null) {
-                    exec.autoModelRouter.target = null;
-                    exec.autoModelRouter.kept = actual;
-                    safeLog(ctx, 'info', `kept session ${sid} on ${actual} (manual choice respected, no switch).`);
-                    target = null;
-                  }
-                }
-              }
-            } catch { /* 读回失败走原路径（realSwitch 内还有权威短路兜底） */ }
-            if (target && sid && sid !== 'unknown' && freeModelOk !== false) {
-              // 不 await：切模型是后台操作，工具本次执行不受影响（下轮生效）
-              // v0.5.2：透传 route.mode —— 冷启动空台账时 realSwitch 内二次判定需要它，
-              // 不传则 manualKeepReason 缺 routeMode 保守短路，跨类也切不动（crash 3 FAIL 根因）。
-              realSwitch(sid, target, route?.mode ?? '').then((r) => {
-                try {
-                  exec.autoModelRouter.switched = r.ok;
-                  if (!r.ok) exec.autoModelRouter.switchError = r.reason;
-                } catch { /* noop */ }
-              }).catch(() => {});
-            }
-          } catch { /* 真切调度失败不影响放行 */ }
+          // ── v0.7.2 阶段三 3.4：pre-execute 旧文本真切降级为纯注解 ──
+          // 真切以 agent/pre-step 的状态机决策为准（避免双钩子打架：文本触发的真切与
+          // 状态机路由会互相覆盖，且 fire-and-forget 与 prompt 组装赛跑读不到新选择）。
+          // 注解（annotateRoute）与 JSONL 诊断照写；工具升档已在上方 3.1 完成。
           return await next();
         } catch (err) {
           try {
@@ -967,6 +992,23 @@ export function apply(ctx, config = {}) {
     } catch { return { text: '', skipReason: null, rejectedText: '' }; }
   }
 
+  // ── v0.7.2 阶段三 3.5：任务进行中判定 ──
+  // 末条消息是带未回应 tool_calls 的 assistant（工具请求尚未产出结果）→ 视为任务进行中，
+  // 降档计数冻结（nextSessionMode 的 pendingToolCalls 参数）。
+  function hasPendingToolCalls(messages) {
+    try {
+      const list = Array.isArray(messages) ? messages : [];
+      if (!list.length) return false;
+      const last = list[list.length - 1];
+      if (!last || last.role !== 'assistant') return false;
+      if (Array.isArray(last.tool_calls) && last.tool_calls.length > 0) return true;
+      if (Array.isArray(last.content)) {
+        return last.content.some((b) => b && typeof b === 'object' && (b.type === 'tool_use' || b.type === 'tool_call'));
+      }
+      return false;
+    } catch { return false; }
+  }
+
   function textSig(s) {
     try {
       let h = 0;
@@ -1040,9 +1082,65 @@ export function apply(ctx, config = {}) {
       let source = 'main';
       try { source = sourceFromMeta(meta); } catch { source = 'main'; }
 
+      // ── v0.7.2 阶段三 3.2/3.3/3.5：状态机路由（本步 task 的唯一权威来源）──
+      // 优先级（与设计一致）：
+      //   1. isHumanInput 过滤（上方 extractUserText，已跳过的轮次到不了这里 → 计数冻结）
+      //   2. 手动选择优先（下方 realSwitch 内 manualKeepReason，不动）
+      //   3. 状态机：sessionMode==='work' → agent-work；==='chat' → chat
+      //   4. 关键词预判：仅无状态新会话首轮定初始模式（不再全局判定）
+      let smTask = null; // null = 状态机异常降级：decideRoute 内退回关键词分类（旧行为兜底）
+      try {
+        const kwHit = classifyTask(text) === 'agent-work'; // 关键词信号（仅首轮预判 + 降档计数防抖）
+        const pending = hasPendingToolCalls(msgs);         // 任务进行中 → 冻结降档
+        let st = await modeStore.read(sid);                // Map 优先，缺失读侧车（幂等 hydrate）
+        if (!st) {
+          // 无状态新会话首轮：关键词预判定初始模式（chat 首写不触发事件；work 升档触发）
+          const first = kwHit ? 'work' : 'chat';
+          modeStore.set(sid, { mode: first, chatTurns: 0, reason: 'first-round-predict' });
+          st = { mode: first, chatTurns: 0 };
+        } else {
+          // v0.7.2 修正（turn 计数）：降档计数按真人 turn 结算。
+          // 本分支每真人 turn 只进一次（stepRouted 按 sid|turn|textSig 去重），语义 = 一个 turn。
+          // 结算顺序：①本 turn 有真实工具调用（tool 标记，pre-execute 置位）→ 清零计数并消费标记；
+          // ②无工具调用 → 关键词防抖（有 kw 清零）否则 chatTurns+1，>=3 降 chat。
+          // pending（任务进行中）→ 冻结计数。观测型工具永不置 tool 标记（pre-execute 已排除）。
+          const hadTool = st.tool === true;
+          // 先消费标记（无论哪条分支，标记只活一个 turn）
+          let next;
+          let why;
+          if (hadTool) {
+            // 有真实工具调用（上一 turn 的工具在本 turn 消费）：本 turn 即新 turn 的起点。
+            // 边界1：本轮又有关键词（新工作指令）→ 不计数，保持 work/0。
+            // 边界2：本轮稍后又有新工具调用 → pre-execute 会重新置 tool 标记，
+            //   下一轮重新消费，计数永不推进（持续干活不降档）。
+            // 无关键词：本轮就是第 1 轮闲聊，直接起计 chatTurns=1（省掉清零轮，多一轮的问题）。
+            if (kwHit) {
+              next = { mode: 'work', chatTurns: 0 };
+            } else {
+              next = { mode: 'work', chatTurns: 1 };
+            }
+            why = 'tool-call';
+          } else {
+            const effKw = kwHit;
+            next = nextSessionMode(st.mode, false, effKw, st.chatTurns, { pendingToolCalls: pending });
+            why = next.mode !== st.mode ? (next.mode === 'work' ? 'keyword-upgrade' : 'idle-3-turns') : 'chat-turn-count';
+          }
+          if (next.mode !== st.mode || next.chatTurns !== st.chatTurns || hadTool) {
+            modeStore.set(sid, {
+              mode: next.mode,
+              chatTurns: next.chatTurns,
+              tool: false,
+              reason: why,
+            });
+            st = { mode: next.mode, chatTurns: next.chatTurns, tool: false };
+          }
+        }
+        smTask = st.mode === 'work' ? 'agent-work' : 'chat';
+      } catch { /* 状态机失败保守回 chat 关键词兜底（decideRoute 内 classifyTask） */ }
+
       let route;
       try {
-        route = decideRoute({ source, text, meta, currentMode: lastSwitch.get(sid) ? 'work' : null, strategy: cfg.privateChatWorkStrategy });
+        route = decideRoute({ source, text, meta, currentMode: lastSwitch.get(sid) ? 'work' : null, strategy: cfg.privateChatWorkStrategy, task: smTask });
       } catch { return await next(); }
 
       ensureFresh(); // 与 pre-execute 一致：过期才后台补拉
@@ -1052,6 +1150,7 @@ export function apply(ctx, config = {}) {
       // JSONL 诊断：纯聊天轮第一次有落盘（tool=agent/pre-step）
       try {
         const target = holder?.autoModelRouter?.target ?? null;
+        const ms = peekSessionMode(sid); // v0.7.2 阶段二：状态机投影（热 Map，缺失 null）
         const logEntry = {
           sid,
           tool: 'agent/pre-step',
@@ -1063,6 +1162,8 @@ export function apply(ctx, config = {}) {
           actualSel: null,
           turn: payload?.turn ?? null,
           step: payload?.step ?? null,
+          mode: ms?.mode ?? null,
+          chatTurns: ms?.chatTurns ?? null,
         };
         try { logEntry.actualSel = readSelectionForRoute(sid); } catch { /* 读回失败留空 */ }
         appendRouteLog(logEntry).catch(() => {});
@@ -1107,6 +1208,7 @@ export function apply(ctx, config = {}) {
         }
         // 决策后补一条：keepReason / 真实读回 / 是否真切，阶段二核对全靠这行
         try {
+          const dms = peekSessionMode(sid); // v0.7.2 阶段二：状态机投影（热 Map，缺失 null）
           const decision = {
             sid,
             tool: 'agent/pre-step/decision',
@@ -1119,6 +1221,8 @@ export function apply(ctx, config = {}) {
             actualSel: null,
             turn: payload?.turn ?? null,
             step: payload?.step ?? null,
+            mode: dms?.mode ?? null,
+            chatTurns: dms?.chatTurns ?? null,
           };
           try { decision.actualSel = readSelectionForRoute(sid); } catch { decision.actualSel = null; }
           appendRouteLog(decision).catch(() => {});

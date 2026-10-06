@@ -9,6 +9,7 @@
     "src/index.js",
     "src/router.js",
     "src/leaderboard.js",
+    "src/session-mode.js",
     "cordis.patch.yml",
     "README.md",
     "CHANGELOG.md",
@@ -37,6 +38,6 @@
     }
   },
   "scripts": {
-    "test": "node test/router.test.mjs && node test/crash.test.mjs && node test/leaderboard.test.mjs"
+    "test": "node test/router.test.mjs && node test/session-mode.test.mjs && node test/crash.test.mjs && node test/leaderboard.test.mjs"
   }
 }

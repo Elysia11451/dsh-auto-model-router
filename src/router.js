@@ -39,8 +39,10 @@ export function isGroupMeta(meta = {}) {
 //  - 私聊闲聊 -> chat（强制回自有，哪怕当前停在 work 档）
 //  - 私聊干活 + free -> work/free（动态最强）；+ owned -> work/owned（自有 API 最强档）
 //  - 群聊闲聊 -> chat；群聊干活 -> work/free（动态最强）
-export function decideRoute({ source, text = '', meta = {}, currentMode = null, strategy = 'free' } = {}) {
-  const task = classifyTask(text);
+export function decideRoute({ source, text = '', meta = {}, currentMode = null, strategy = 'free', task: taskOverride = null } = {}) {
+  // v0.7.2 阶段三 3.3：task 可由会话状态机给出（pre-step/pre-execute 传入）；
+  // 未传（null）时退回关键词分类 —— 供首轮预判兜底与自测/单测直调保持旧行为。
+  const task = taskOverride || classifyTask(text);
   const group = isGroupMeta(meta);
   // v0.6.0 阶段二·修复点一：classifyTask 判 chat ⇒ route.mode 必须是 chat，与 source 无关。
   // 旧版末尾「main 兜底无条件 return work」越权当了 Rule 2 —— 主界面/QQ 单聊闲聊一律落 work，
@@ -217,6 +219,41 @@ export function normalizeEffortForSwitch(effort) {
 }
 
 // 为一次 selectModel 调用组装 payload：sessionId 直传 + effort 归一化。
+ 
+// ── v0.7.2 会话状态机（纯函数，离线单测；取代关键词全局判定）────────────────
+// 输入：
+//   currentMode  当前会话态 'chat'|'work'（非法值一律按 'chat' 处理，冷启动默认态）
+//   hasToolCall  本轮是否已发生真实工具调用（tools/pre-execute 铁证，唯一可信升档信号）
+//   hasKeywords  干活关键词命中信号（classifyTask 结果）。
+//                ⚠ 调用方约束：chat 态只允许首轮（无状态新会话）传真，
+//                非首轮关键词不作为路由依据（仅在 work 态用于清零计数）——
+//                "仅首轮预判加速"的门禁放在调用层，纯函数保持无状态。
+//   chatTurns    连续「无工具、无关键词」轮数（work 态降档计数器）
+//   opts.pendingToolCalls  任务进行中（有未完成 tool_calls）→ 冻结计数，禁止降档
+// 返回 { mode, chatTurns }：
+//   工具调用  -> work/0（升档铁证，优先级最高）
+//   chat+关键词（首轮预判）-> work/0
+//   chat 闲聊 -> chat/0
+//   work+关键词 -> work/0（干活延续，清零计数）
+//   work 无工具无关键词 -> 计数 +1；连续 3 轮（入值 >=2 即下一轮达 3）-> chat/0
+//   work + pendingToolCalls -> work/计数冻结
+export function nextSessionMode(currentMode, hasToolCall, hasKeywords, chatTurns, opts = {}) {
+  const mode = currentMode === 'work' ? 'work' : 'chat';
+  const raw = Number(chatTurns);
+  const n = Number.isFinite(raw) && raw > 0 ? Math.trunc(raw) : 0;
+  if (hasToolCall) return { mode: 'work', chatTurns: 0 };
+  if (mode === 'chat') {
+    if (hasKeywords) return { mode: 'work', chatTurns: 0 };
+    return { mode: 'chat', chatTurns: 0 };
+  }
+  // mode === 'work'
+  if (hasKeywords) return { mode: 'work', chatTurns: 0 };
+  if (opts && opts.pendingToolCalls) return { mode: 'work', chatTurns: n }; // 任务进行中禁降档
+  const next = n + 1;
+  if (next >= 3) return { mode: 'chat', chatTurns: 0 }; // 阈值 3：入值 2 即降档
+  return { mode: 'work', chatTurns: next };
+}
+
 export function buildSelectModelPayload({ sessionId, provider, model, effort }) {
   const payload = {
     sessionId: String(sessionId || ''),

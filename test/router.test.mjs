@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { classifyTask, sourceFromMeta, isGroupMeta, isSameKind, decideRoute, buildGroupHint, normalizeEffortForSwitch, buildSelectModelPayload, resolveChatTarget, parseManualWorkLock, isColdStartCrossKind, isUnknownDrift, isWorkModelRef, DEFAULTS } from '../src/router.js';
+import { classifyTask, sourceFromMeta, isGroupMeta, isSameKind, decideRoute, buildGroupHint, normalizeEffortForSwitch, buildSelectModelPayload, resolveChatTarget, parseManualWorkLock, isColdStartCrossKind, isUnknownDrift, isWorkModelRef, nextSessionMode, DEFAULTS } from '../src/router.js';
 import { DEFAULT_WORK_MODEL_PRIORITY } from '../src/leaderboard.js';
 
 const t = (name, fn) => { try { fn(); console.log(`ok - ${name}`); } catch (e) { console.error(`FAIL - ${name}: ${e.message}`); process.exitCode = 1; } };
@@ -253,6 +253,58 @@ t('classifyTask recognizes 建文件 variants as work', () => {
   assert.equal(classifyTask('创建文件 test.txt'), 'agent-work');
   assert.equal(classifyTask('生成文件 report.md'), 'agent-work');
   assert.equal(classifyTask('please create file test.txt'), 'agent-work');
+});
+
+
+// ── v0.7.2 状态机真值表（nextSessionMode 纯函数，8 行全覆盖 + 阈值边界）──
+t('S1 chat + tool call -> work/0 (升档铁证)', () => {
+  assert.deepEqual(nextSessionMode('chat', true, false, 0), { mode: 'work', chatTurns: 0 });
+});
+t('S2 chat + keywords (首轮预判) -> work/0', () => {
+  assert.deepEqual(nextSessionMode('chat', false, true, 0), { mode: 'work', chatTurns: 0 });
+});
+t('S3 chat no tool no keywords -> chat/0 (闲聊保持)', () => {
+  assert.deepEqual(nextSessionMode('chat', false, false, 0), { mode: 'chat', chatTurns: 0 });
+});
+t('S4 work + tool call -> work/0 (干活延续)', () => {
+  assert.deepEqual(nextSessionMode('work', true, false, 2), { mode: 'work', chatTurns: 0 });
+});
+t('S5 work + keywords -> work/0 (清零不断档)', () => {
+  assert.deepEqual(nextSessionMode('work', false, true, 2), { mode: 'work', chatTurns: 0 });
+});
+t('S6 work no tool no keywords counts up (n<2 -> n+1)', () => {
+  assert.deepEqual(nextSessionMode('work', false, false, 0), { mode: 'work', chatTurns: 1 });
+  assert.deepEqual(nextSessionMode('work', false, false, 1), { mode: 'work', chatTurns: 2 });
+});
+t('S7 work reaches threshold 3 -> chat/0 (降档)', () => {
+  assert.deepEqual(nextSessionMode('work', false, false, 2), { mode: 'chat', chatTurns: 0 });
+  // 边界外输入（异常值 >=3）同样降档，不悬空
+  assert.deepEqual(nextSessionMode('work', false, false, 9), { mode: 'chat', chatTurns: 0 });
+});
+t('S8 work + pendingToolCalls freezes counter (禁降档)', () => {
+  assert.deepEqual(nextSessionMode('work', false, false, 1, { pendingToolCalls: true }), { mode: 'work', chatTurns: 1 });
+  assert.deepEqual(nextSessionMode('work', false, false, 2, { pendingToolCalls: true }), { mode: 'work', chatTurns: 2 });
+  // 冻结优先级：仍低于工具调用升档（有工具 -> 归零不算冻结）
+  assert.deepEqual(nextSessionMode('work', true, false, 2, { pendingToolCalls: true }), { mode: 'work', chatTurns: 0 });
+});
+t('S9 边角：非法 currentMode/NaN 计数按 chat/0 兜底', () => {
+  assert.deepEqual(nextSessionMode('unknown-mode', false, false, undefined), { mode: 'chat', chatTurns: 0 });
+  assert.deepEqual(nextSessionMode(null, false, false, 'abc'), { mode: 'chat', chatTurns: 0 });
+  // work 态计数非法值按 0 起算
+  assert.deepEqual(nextSessionMode('work', false, false, 'abc'), { mode: 'work', chatTurns: 1 });
+});
+t('S10 阈值边界序列：work 连续 3 轮无工具无关键词恰好降档，第 1/2 轮不抖动', () => {
+  let s = { mode: 'work', chatTurns: 0 };
+  s = nextSessionMode(s.mode, false, false, s.chatTurns);
+  assert.deepEqual(s, { mode: 'work', chatTurns: 1 }, '第1轮保持 work');
+  s = nextSessionMode(s.mode, false, false, s.chatTurns);
+  assert.deepEqual(s, { mode: 'work', chatTurns: 2 }, '第2轮保持 work');
+  s = nextSessionMode(s.mode, false, false, s.chatTurns);
+  assert.deepEqual(s, { mode: 'chat', chatTurns: 0 }, '第3轮降档');
+  // 中途来一次关键词 -> 清零重新起算
+  s = { mode: 'work', chatTurns: 1 };
+  s = nextSessionMode(s.mode, false, true, s.chatTurns);
+  assert.deepEqual(s, { mode: 'work', chatTurns: 0 }, '关键词清零');
 });
 
 console.log('router tests done');
