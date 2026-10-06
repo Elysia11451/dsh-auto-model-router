@@ -5,8 +5,13 @@
   "license": "MIT",
   "type": "module",
   "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./client": "./src/client.js"
+  },
   "files": [
     "src/index.js",
+    "src/client.js",
     "src/router.js",
     "src/leaderboard.js",
     "src/session-mode.js",
@@ -35,6 +40,14 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-plugin-manager"
+      ],
+      "platform": "web"
     }
   },
   "scripts": {
