@@ -903,14 +903,39 @@ export function apply(ctx, config = {}) {
   // manualKeepReason / annotateRoute / realSwitch 任何一行路由核心逻辑。
   const stepRouted = new Map(); // sid|turn|textSig -> 已路由时间戳（同一轮只判一次）
   const stepProbed = new Set(); // sid|turn -> 已记录过"取不到文本"的形状探针（每轮只探一次）
+  const stepSkipped = new Set(); // sid|turn -> 已记录过"系统注入跳过"（每轮只记一次）
+
+  // ── v0.7.1 来源过滤（本版唯一改动点）──────────────────────────────────────
+  // 只认真人输入：source.kind === 'user' 且不是插件/系统注入的通知。
+  // 实测形状（2026-10-06 真机会话普查）：
+  //   真人      {"kind":"user","rpcId":...} / QQ {"kind":"user","rpcId":"qq-..."}
+  //   auto-continue 重试注入（bug 主角）
+  //             {"kind":"user","producer":"dsh-auto-continue","form":"notice"}
+  //   其他非人  runtime-context / dsh-mnemon / goal / user-approval / model-selection / 无 source 合成消息
+  // 注意：重试通知故意把 kind 伪造成 "user"（为了在聊天界面渲染气泡），
+  // 所以只看 kind 不够，必须同时排掉 producer 署名与 form=notice。
+  function isHumanInput(m) {
+    try {
+      const s = m?.source;
+      if (!s || s.kind !== 'user') return false;
+      if (s.producer) return false;             // 插件署名注入（dsh-auto-continue 等）
+      if (s.form === 'notice') return false;    // 通知形注入
+      return true;
+    } catch { return false; }
+  }
 
   // 从 pre-step 的 messages 里取出用户消息原文。
-  // 首选 role==='user' 的最后一条；若本批消息压根没有 user 角色（不同宿主版本形状有别），
-  // 退化取最后一条有文本的消息 —— 取不到就必须留探针，不能静默丢轮。
+  // 首选 role==='user' 的最后一条（须通过 isHumanInput）；若本批消息压根没有 user 角色
+  // （不同宿主版本形状有别），退化取最后一条真人输入、有文本的消息。
+  // 取不到就必须留探针，不能静默丢轮。
+  // 返回 { text, skipReason, rejectedText }：
+  //   text         —— 作为路由依据的真人文本（'' = 不可用于路由）
+  //   skipReason   —— 'system-retry-skipped' 表示末条 user 形消息是系统/插件注入
+  //   rejectedText —— 被拒消息的原文（供跳过日志取证，不参与路由）
   function extractUserText(messages) {
     try {
       const list = Array.isArray(messages) ? messages : [];
-      if (!list.length) return '';
+      if (!list.length) return { text: '', skipReason: null, rejectedText: '' };
       const toText = (m) => {
         try {
           const c = m?.content;
@@ -921,22 +946,25 @@ export function apply(ctx, config = {}) {
           return '';
         } catch { return ''; }
       };
-      const isNotice = (m) => m?.source?.kind === 'model-selection'; // 模型切换通知不是人话
       const users = list.filter((m) => m && m.role === 'user');
       if (users.length) {
         const last = users[users.length - 1];
-        if (isNotice(last)) return '';
-        return toText(last);
+        if (!isHumanInput(last)) {
+          const raw = toText(last);
+          // 有文本的非人消息 = 系统重试/插件通知 → 明确跳过；无文本 → 走旧探针路径。
+          return { text: '', skipReason: raw ? 'system-retry-skipped' : null, rejectedText: raw };
+        }
+        return { text: toText(last), skipReason: null, rejectedText: '' };
       }
-      // 退化路径：无 user 角色时取最后一条非通知、有文本的消息
+      // 退化路径：无 user 角色时取最后一条真人输入、有文本的消息
       for (let i = list.length - 1; i >= 0; i -= 1) {
         const m = list[i];
-        if (!m || isNotice(m)) continue;
+        if (!m || !isHumanInput(m)) continue;
         const t = toText(m);
-        if (t) return t;
+        if (t) return { text: t, skipReason: null, rejectedText: '' };
       }
-      return '';
-    } catch { return ''; }
+      return { text: '', skipReason: null, rejectedText: '' };
+    } catch { return { text: '', skipReason: null, rejectedText: '' }; }
   }
 
   function textSig(s) {
@@ -954,8 +982,33 @@ export function apply(ctx, config = {}) {
       const holder = { agent };
       const sid = sidOf(holder);
       const msgs = Array.isArray(payload?.messages) ? payload.messages : [];
-      const text = extractUserText(msgs);
+      const { text, skipReason, rejectedText } = extractUserText(msgs);
       if (!text) {
+        // v0.7.1 来源过滤：本步输入是系统/插件注入的重试通知等（非真人消息）→
+        // 一律跳过路由决策，保持当前模型不变；落一行 reason=system-retry-skipped 便于验证。
+        if (skipReason === 'system-retry-skipped') {
+          const skey = `${sid || 'unknown'}|${payload?.turn ?? '?'}`;
+          if (!stepSkipped.has(skey)) {
+            if (stepSkipped.size > 500) stepSkipped.clear();
+            stepSkipped.add(skey);
+            try {
+              let actual = null;
+              try { actual = readSelectionForRoute(sid); } catch { actual = null; }
+              appendRouteLog({
+                sid,
+                tool: 'agent/pre-step/skip',
+                extractText: String(rejectedText ?? '').slice(0, 300),
+                task: '', route: '', target: null,
+                keepReason: 'system-retry-skipped',
+                reason: 'system-retry-skipped',
+                actualSel: actual,
+                turn: payload?.turn ?? null,
+                step: payload?.step ?? null,
+              }).catch(() => {});
+            } catch { /* 跳过日志失败不阻断 */ }
+          }
+          return await next();
+        }
         // 形状探针：取不到文本 ≠ 没有轮次。每 (sid,turn,step) 记一次角色形状，
         // 阶段一若失败，这一行就是定位"消息形状对不上"的唯一线索。
         if (msgs.length) {

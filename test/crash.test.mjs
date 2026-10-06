@@ -533,4 +533,126 @@ await t('reclaim unknown model=false keeps conservatively (no switch)', async ()
   }
 });
 
+// ── v0.7.1 来源过滤（system-retry-skipped）────────────────────────────────
+// bug 复刻：auto-continue 的重试注入把 kind 伪造成 "user"（producer/form 署名真机实测），
+// 旧逻辑取到最后一条 user 形消息 → classifyTask 误判 chat → 切回 GLM 中断 Work。
+// 新逻辑：末条 user 形消息非真人输入 → 不路由、不切换，落 reason=system-retry-skipped。
+
+// 用例 1：真机形状的 auto-continue 重试通知（kind=user + producer + form=notice）
+await t('auto-continue retry notice skipped (system-retry-skipped, no switch)', async () => {
+  const fsP = await import('node:fs/promises');
+  const osP = await import('node:os');
+  const pathP = await import('node:path');
+  const home = await fsP.mkdtemp(pathP.join(osP.tmpdir(), 'router-srcfilter-'));
+  const prevHome = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  try {
+    const { ctx, handlers, calls } = makeCtx();
+    apply(ctx, { enableDynamicRanking: false });
+    const h = handlers['agent/pre-step'];
+    assert.equal(typeof h, 'function', 'pre-step hook must be registered');
+    const sid = 'session-srcfilter-notice';
+    let nextCalled = 0;
+    const payload = {
+      agent: { session: sid, source: { channel: 'main' } },
+      turn: 25, step: 1,
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: '帮我建个 test.txt' }], source: { kind: 'user', rpcId: 'x-human-1' } },
+        {
+          role: 'user',
+          content: [{ type: 'text', text: '继续：muse-spark-1.3-contributor-free 模型运行失败，14 秒后自动重试（1/1）' }],
+          source: { kind: 'user', producer: 'dsh-auto-continue', form: 'notice', summary: '继续' },
+        },
+      ],
+    };
+    await h(payload, async () => { nextCalled += 1; return 'ALLOWED'; });
+    await new Promise((r) => setTimeout(r, 80));
+    assert.equal(nextCalled, 1, 'step must pass through');
+    assert.equal(calls.length, 0, 'system retry notice must not trigger any model switch');
+    const log = await fsP.readFile(pathP.join(home, 'logs', 'auto-router.jsonl'), 'utf8');
+    const lines = log.split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    const skip = lines.find((l) => l.tool === 'agent/pre-step/skip');
+    assert.ok(skip, 'skip log line must be written');
+    assert.equal(skip.reason, 'system-retry-skipped');
+    assert.equal(skip.keepReason, 'system-retry-skipped');
+    assert.equal(skip.sid, sid);
+    assert.ok(String(skip.extractText).includes('模型运行失败'), 'rejected text kept for forensics');
+    assert.equal(lines.some((l) => l.tool === 'agent/pre-step/decision'), false, 'no route decision for non-human input');
+  } finally {
+    if (prevHome === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = prevHome;
+  }
+});
+
+// 用例 2：字面口径 —— source.kind !== 'user' 的系统消息（runtime-context 快照形）
+await t('non-user kind message skipped (system-retry-skipped, no switch)', async () => {
+  const fsP = await import('node:fs/promises');
+  const osP = await import('node:os');
+  const pathP = await import('node:path');
+  const home = await fsP.mkdtemp(pathP.join(osP.tmpdir(), 'router-srcfilter2-'));
+  const prevHome = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  try {
+    const { ctx, handlers, calls } = makeCtx();
+    apply(ctx, { enableDynamicRanking: false });
+    const h = handlers['agent/pre-step'];
+    const sid = 'session-srcfilter-sys';
+    let nextCalled = 0;
+    await h({
+      agent: { session: sid, source: {} },
+      turn: 7, step: 1,
+      messages: [
+        { role: 'user', content: '今天天气怎么样', source: { kind: 'runtime-context', form: 'snapshot' } },
+      ],
+    }, async () => { nextCalled += 1; return 'ALLOWED'; });
+    await new Promise((r) => setTimeout(r, 80));
+    assert.equal(nextCalled, 1, 'step must pass through');
+    assert.equal(calls.length, 0, 'non-user kind must not trigger routing/switch');
+    const log = await fsP.readFile(pathP.join(home, 'logs', 'auto-router.jsonl'), 'utf8');
+    const lines = log.split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    const skip = lines.find((l) => l.tool === 'agent/pre-step/skip');
+    assert.ok(skip, 'skip log line must be written');
+    assert.equal(skip.reason, 'system-retry-skipped');
+  } finally {
+    if (prevHome === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = prevHome;
+  }
+});
+
+// 用例 3：真人消息（kind=user + rpcId，真机 QQ 形状）→ 正常触发路由并真切 chat
+await t('human message routes normally (kind=user, switch issued)', async () => {
+  const fsP = await import('node:fs/promises');
+  const osP = await import('node:os');
+  const pathP = await import('node:path');
+  const home = await fsP.mkdtemp(pathP.join(osP.tmpdir(), 'router-srcfilter3-'));
+  const prevHome = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  try {
+    const { ctx, handlers, calls } = makeCtx();
+    apply(ctx, { enableDynamicRanking: false });
+    const h = handlers['agent/pre-step'];
+    const sid = 'session-srcfilter-human';
+    let nextCalled = 0;
+    await h({
+      agent: { session: sid, source: { channel: 'qq' } },
+      turn: 3, step: 1,
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: '今天天气怎么样' }], source: { kind: 'user', rpcId: 'qq-abc-123', clientTimeZone: 'Asia/Shanghai' } },
+      ],
+    }, async () => { nextCalled += 1; return 'ALLOWED'; });
+    await new Promise((r) => setTimeout(r, 120));
+    assert.equal(nextCalled, 1, 'step must pass through');
+    assert.equal(calls.length, 1, 'human chat message must trigger the chat switch');
+    assert.equal(calls[0].provider, 'zai-coding-cn');
+    assert.equal(calls[0].model, 'glm-5.3-flash');
+    const log = await fsP.readFile(pathP.join(home, 'logs', 'auto-router.jsonl'), 'utf8');
+    const lines = log.split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    const decision = lines.find((l) => l.tool === 'agent/pre-step/decision');
+    assert.ok(decision, 'decision log must exist for human input');
+    assert.equal(decision.task, 'chat');
+    assert.equal(decision.route, 'chat');
+    assert.equal(lines.some((l) => l.tool === 'agent/pre-step/skip'), false, 'human input must not be skipped');
+  } finally {
+    if (prevHome === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = prevHome;
+  }
+});
+
 console.log('crash tests done');
