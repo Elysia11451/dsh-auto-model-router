@@ -27,55 +27,60 @@ export const name = 'dsh-auto-model-router';
 // 移动端规范强制 inject = ['tools', 'llm']（多写会导致 PENDING）。
 // sessionController / agentDefaultModel 只走 ctx.get 可选获取，缺席时降级为注解模式。
 export const inject = ['tools', 'llm'];
+// v0.7.5: 设置页命名空间 = profile entry id（Host 用 entry id 自动识别，不再自报）。
+export const SETTINGS_NAMESPACE = 'auto-model-router';
 
 // ── 插件配置（设置 → 插件 → 插件配置 自动投影成表单）──
-// v0.5.1：真 Schemastery schema（规格红线：禁 stub / workaround / 裸对象）。
-// 宿主 cordis: resolveConfig → runtime.Config["~standard"].validate(config)；
-//              collectConfigSchemas → 'toJSON' in schema —— 两者由真 schema 天然满足。
-// description({zh,en}) 是 schemastery 3.18.4 合法写法（存 schema.meta.description，string|Dict 双语，
-//   本机实测 meta.description 落 {zh,en}、toJSON 正常、dsh-settings describe 不再炸）。
-// 运维键（chatProvider 等）不带默认值：validate 缺失时原样不带该键，
-//   {...DEFAULTS, ...config} 由 router.js DEFAULTS 兜底——若给空串默认会反向盖掉 DEFAULTS。
-// 规格 7 键带默认值（缺省也必在 config 中，行为与 DEFAULTS 一致或以规格为准）。
+// v0.7.5：全部用户字段 .volatile()（Host 只为含 volatile 字段的 entry 提供表单），
+//   运维键彻底删除（方案a），旧 patch 残留由 DEFAULTS 兜底；自测键 hidden 不进表单。
+// description({zh,en}) 首句写死条件语义（§4 按不支持档做，全量展示+静默忽略）。
 export const Config = Schema.object({
-  // —— 规格 7 键（m01006 一字不减）——
-  chatModel: Schema.string().default('')
-    .description({ zh: '聊天模型（自有 API），格式：provider/model。留空 = 自动用你自有 API 的默认模型（agent-default-model 当前值）；未配自有 API 则回退 workModelFallback 并打警告', en: 'Chat model (owned API), format provider/model; empty = auto-use your owned API default model (agent-default-model current value); falls back to workModelFallback with warning when no owned API is configured' }),
-  workModelFallback: Schema.string().default('mimo-v2.6-flash-free')
-    .description({ zh: '干活模型回退值（动态排行榜不可用时使用）', en: 'Work model fallback (used when dynamic ranking is unavailable)' }),
-  privateChatWorkStrategy: Schema.union(['free', 'owned']).default('free')
-    .description({ zh: '私聊干活策略：free=免费池动态最强，owned=自有 API', en: 'Private chat work strategy: free = strongest free pool, owned = own API' }),
-  hintCooldownMs: Schema.number().default(300000)
-    .description({ zh: '群聊提示冷却时间（毫秒）', en: 'Group hint cooldown (ms)' }),
-  enableDynamicRanking: Schema.boolean().default(true)
-    .description({ zh: '是否启用 OpenRouter 动态排行榜', en: 'Enable OpenRouter dynamic ranking' }),
-  reclaimUnknownModel: Schema.boolean().default(true)
-    .description({ zh: '未知模型纠偏：当前模型既非聊天目标也非配置的干活模型（外部漂移）时强制放回路由目标；关闭则保持"不认识就不动"的保守逻辑', en: 'Reclaim unknown drifted models: when the current model is neither the chat target nor the configured work model (external drift), force it back to the routing target; off keeps the conservative do-nothing behavior' }),
-  manualWorkModel: Schema.string().default('')
-    .description({ zh: '手动锁定的 work 模型（格式：provider/model）。填写后，Agent 干活时强制使用此模型，忽略动态排行榜', en: 'Manually locked work model (provider/model); forces work tasks to this model and skips dynamic ranking' }),
-  manualWorkModelLocked: Schema.boolean().default(false)
-    .description({ zh: '是否启用手动锁定 work 模型。开启后，work 场景不再使用动态排行榜', en: 'Enable manual work-model lock; locked work scenes skip dynamic ranking' }),
-  // v0.7.0 静态降级链（不带默认值：validate 缺失时不带该键，由 DEFAULTS.workModelPriority 兜底）。
-  workModelPriority: Schema.array(Schema.string())
-    .description({ zh: '干活模型静态降级链（按优先级排序；动态排行榜不可用时依次挑选当前可用者，全不中回退 workModelFallback）', en: 'Static work-model fallback chain in priority order; picked against the availability list when dynamic ranking is unavailable, falls back to workModelFallback when none match' }),
-  // —— 运维键（路由所需；模型/档位一律读配置，路由逻辑零硬编码；不带默认，防盖 DEFAULTS）——
-  chatProvider: Schema.string().description({ zh: '聊天模型 provider（chatModel 为裸模型名时搭配）', en: 'Chat model provider (paired when chatModel is a bare model name)' }),
-  chatEffort: Schema.string().description({ zh: '聊天档位（light/deep…）', en: 'Chat effort level' }),
-  workProvider: Schema.string().description({ zh: '干活模型 provider', en: 'Work model provider' }),
-  workModel: Schema.string().description({ zh: '干活模型（旧键/占位）', en: 'Work model (legacy key)' }),
-  workEffort: Schema.string().description({ zh: '干活档位（free 策略）', en: 'Work effort (free strategy)' }),
-  workEffortOwned: Schema.string().description({ zh: '干活档位（owned 策略）', en: 'Work effort (owned strategy)' }),
-  hintMaxCount: Schema.number().description({ zh: '群聊提示累计上限', en: 'Group hint count cap' }),
-  // —— 隔离自测门控键（生产不配 = 不运行）——
-  selftest: Schema.union([Schema.boolean(), Schema.string()]).default(false)
+  // —— 分组 A · 基础（默认展开，enabled 置顶）——
+  enabled: Schema.boolean().default(true).volatile()
+    .description({ zh: '总开关。关闭后插件只记日志不切换模型', en: 'Master switch. When off, the plugin only logs and never switches models' }),
+  priorityMode: Schema.union(['manual', 'auto']).default('manual').volatile()
+    .description({ zh: '手动优先：你在模型选择器里手动选的永远不动；路由优先：插件判该切就切', en: 'Manual-first: your manual selection always wins; Auto-first: the router switches whenever it decides' }),
+  // —— 分组 B · Work 档（默认展开）——
+  workMode: Schema.union(['manual', 'auto']).default('auto').volatile()
+    .description({ zh: '手动：固定用下方填的模型，不跑排行榜；自动：动态榜 + 降级链自动挑', en: 'Manual: pin the model below, no ranking; Auto: dynamic ranking + fallback chain' }),
+  manualWorkModel: Schema.string().default('').volatile()
+    .description({ zh: '仅手动模式生效。格式 provider/model，留空等于没锁', en: 'Only used in manual mode. Format provider/model; empty means unlocked' }),
+  workModelPriority: Schema.array(Schema.string()).default(['mimo-v2.6-flash-free', 'glm-5.3-flash', 'deepseek-v4.1-flash']).volatile()
+    .description({ zh: '仅自动模式生效。动态榜不可用时按序挑可用者，全不中回退兜底', en: 'Only used in auto mode. Ordered fallback chain when ranking is unavailable' }),
+  workModelFallback: Schema.string().default('mimo-v2.6-flash-free').volatile()
+    .description({ zh: '仅自动模式生效。链上全不中时的最后一兜底（裸模型名）', en: 'Only used in auto mode. Last resort when the whole chain misses' }),
+  enableDynamicRanking: Schema.boolean().default(true).volatile()
+    .description({ zh: '仅自动模式生效。开：抓 OpenRouter 榜；关：直接走静态链，一次请求都不发', en: 'Only used in auto mode. On: fetch OpenRouter ranking; off: static chain only, zero requests' }),
+  rankingRefreshSeconds: Schema.number().default(3600).min(30).max(3600).volatile()
+    .description({ zh: '仅自动+开启动态榜时生效。排行榜刷新间隔（秒，30-3600）', en: 'Only used when auto mode + ranking on. Ranking refresh interval in seconds (30-3600)' }),
+  // —— 分组 C · Chat 档（默认展开）——
+  chatMode: Schema.union(['manual', 'auto']).default('auto').volatile()
+    .description({ zh: '手动：固定用下方填的自有 API 模型；自动：按下方降级链从便宜到贵挑', en: 'Manual: pin your owned-API model below; Auto: walk the chain below from cheapest upward' }),
+  manualChatModel: Schema.string().default('').volatile()
+    .description({ zh: '仅手动模式生效。格式 provider/model；裸模型名配你自己的 provider；留空回退兜底并打警告', en: 'Only used in manual mode. provider/model; bare name pairs with your provider; empty falls back with a warning' }),
+  chatModelPriority: Schema.array(Schema.string()).default(['zai-coding-cn/glm-5.3-flash', 'deepseek/deepseek-chat']).volatile()
+    .description({ zh: '仅自动模式生效。从便宜到贵排序，依次挑你配过 key 的可用者', en: 'Only used in auto mode. Cheapest-first; picks the first one you have a key for' }),
+  // —— 分组 D · 群聊（默认折叠，高级）——
+  enableGroupHint: Schema.boolean().default(false).volatile()
+    .description({ zh: '群聊工作模型提示。默认关（防打扰）；开后 work 档群聊发一次切换提示', en: 'Group work-model hint. Off by default to avoid noise' }),
+  hintCooldownMs: Schema.number().default(300000).volatile()
+    .description({ zh: '提示冷却（毫秒）。群聊提示发一次后多久内不再发', en: 'Hint cooldown in ms' }),
+  // —— 分组 E · 状态机（默认折叠，高级）——
+  switchCooldownMs: Schema.number().default(5000).volatile()
+    .description({ zh: '同一会话连续切换冷却（毫秒）。切得太频繁被吞时调小', en: 'Per-session switch cooldown in ms; lower it when rapid switches get swallowed' }),
+  reclaimUnknownModel: Schema.boolean().default(true).volatile()
+    .description({ zh: '未知漂移纠偏。开：当前模型既非聊天目标也非干活配置时强制放回路由目标；关：不认识就不动', en: 'Reclaim unknown drift. On: force back to route target; off: leave unknown models alone' }),
+  // —— 隐藏键（隔离自测专用，非 volatile + hidden，不进表单）——
+  selftest: Schema.union([Schema.boolean(), Schema.string()]).default(false).hidden(true)
     .description({ zh: '隔离自测开关（仅隔离环境配置；生产不配置该键）', en: 'Isolation selftest switch (isolated env only; not set in production)' }),
-  selftestRound: Schema.string().default('')
+  selftestRound: Schema.string().default('').hidden(true)
     .description({ zh: '自测回合（r1..r6/all）', en: 'Selftest round (r1..r6/all)' }),
-  selftestOut: Schema.string().default('')
+  selftestOut: Schema.string().default('').hidden(true)
     .description({ zh: '自测结果输出路径', en: 'Selftest result output path' }),
-  switchCooldownMs: Schema.number().default(5000)
-    .description({ zh: '同一会话连续切换冷却（毫秒），连续操作频繁时调小避免吞纠偏', en: 'Per-session switch cooldown in ms; lower it when rapid successive switches are swallowed' }),
 });
+
+// v0.7.5: 默认导出（loader unwrapExports 归一化 ESM/CJS 形态；具名导出保留，单测直引不受影响）。
+export default { name, inject, Config, apply, SETTINGS_NAMESPACE };
 
 // selftest 门控（cfg.selftest）时捕获 safeLog 输出，供隔离验证断言；生产为 null 不生效。
 let selftestLines = null;
@@ -108,21 +113,94 @@ function safeLog(ctx, level, msg) {
 }
 
 export function apply(ctx, config = {}) {
-  const cfg = { ...DEFAULTS, ...(config || {}) };
+  // v0.7.5 Step2: volatile 读取（官方 Cookbook 口径：config.字段名.get()，undefined 回落 DEFAULTS）。
+  // 兼容裸对象（单测 apply(ctx,{}) / 旧 patch 残留无 .get）：plain 值直取；缺键回落默认值。
+  const getRaw = (key) => {
+    try {
+      const v = config?.[key];
+      if (v && typeof v === 'object' && typeof v.get === 'function') {
+        try { return v.get(); } catch { return undefined; }
+      }
+      return v;
+    } catch { return undefined; }
+  };
+  const pick = (key, fb) => {
+    const v = getRaw(key);
+    return v === undefined ? fb : v;
+  };
+  // 新 Config（15 volatile）→ 旧 cfg 键合成。legacy 优先：旧 patch/单测传旧键时照用，
+  // 未传才走新字段合成 —— 默认值下合成结果与旧 DEFAULTS 完全一致（路由行为零变化）。
+  function buildCfg() {
+    const c = { ...DEFAULTS };
+    // A 基础（新语义 Step3 接行为；此处只解析）
+    c.enabled = pick('enabled', true);
+    c.priorityMode = pick('priorityMode', 'manual');
+    // B work 档
+    c.workMode = pick('workMode', 'auto');
+    c.manualWorkModel = pick('manualWorkModel', '');
+    c.workModelPriority = pick('workModelPriority', DEFAULTS.workModelPriority);
+    c.workModelFallback = pick('workModelFallback', DEFAULTS.workModelFallback);
+    c.enableDynamicRanking = pick('enableDynamicRanking', true);
+    c.rankingRefreshSeconds = pick('rankingRefreshSeconds', 3600);
+    // C chat 档：legacy chatModel 在场（含空串）走 legacy；否则新字段合成
+    c.chatMode = pick('chatMode', 'auto');
+    c.manualChatModel = pick('manualChatModel', '');
+    c.chatModelPriority = pick('chatModelPriority', ['zai-coding-cn/glm-5.3-flash', 'deepseek/deepseek-chat']);
+    const legacyChat = getRaw('chatModel');
+    if (legacyChat !== undefined) {
+      c.chatProvider = pick('chatProvider', DEFAULTS.chatProvider);
+      c.chatModel = legacyChat;
+    } else if (c.chatMode === 'manual' && String(c.manualChatModel ?? '').trim()) {
+      c.chatProvider = DEFAULTS.chatProvider;
+      c.chatModel = String(c.manualChatModel).trim();
+    } else {
+      c.chatProvider = DEFAULTS.chatProvider;
+      const head = Array.isArray(c.chatModelPriority) && c.chatModelPriority.length > 0 ? String(c.chatModelPriority[0]) : '';
+      c.chatModel = head || DEFAULTS.chatModel;
+    }
+    // 运维键（新 Config 已删）：legacy/单测残留照用，否则 DEFAULTS
+    c.workProvider = pick('workProvider', DEFAULTS.workProvider);
+    c.workModel = pick('workModel', c.workModelFallback || DEFAULTS.workModel);
+    c.workEffortOwned = pick('workEffortOwned', DEFAULTS.workEffortOwned);
+    c.privateChatWorkStrategy = pick('privateChatWorkStrategy', DEFAULTS.privateChatWorkStrategy);
+    c.hintMaxCount = pick('hintMaxCount', DEFAULTS.hintMaxCount);
+    // D 群聊 / E 状态机（新老同键，直接取）
+    c.enableGroupHint = pick('enableGroupHint', false);
+    c.hintCooldownMs = pick('hintCooldownMs', DEFAULTS.hintCooldownMs);
+    c.switchCooldownMs = pick('switchCooldownMs', 5000);
+    c.reclaimUnknownModel = pick('reclaimUnknownModel', true);
+    // 隐藏自测键（plain，非 volatile）
+    c.selftest = pick('selftest', false);
+    c.selftestRound = pick('selftestRound', '');
+    c.selftestOut = pick('selftestOut', '');
+    // 旧档位归一化（off/max → light/deep），不污染 DEFAULTS
+    c.chatEffort = normalizeEffortForSwitch(pick('chatEffort', DEFAULTS.chatEffort)) || 'light';
+    c.workEffort = normalizeEffortForSwitch(pick('workEffort', DEFAULTS.workEffort)) || 'deep';
+    return c;
+  }
+  // let（非 const）：volatile 更新时 reloadCfg 整体重算；自测 t11/t12 照旧运行时改 cfg 字段。
+  let cfg = buildCfg();
   // v0.5.0 新增开关：enableDynamicRanking=false 时直接回退，不发起 OpenRouter 请求。
   // let（非 const）：自测 t10 需临时翻转该开关断言 guard（刷新函数/选模函数都读它）。
+  // v0.7.5：volatile 更新时重算（reloadCfg），设置页翻开关即时生效。
   let dynamicOn = cfg.enableDynamicRanking !== false;
-  // 如果生产 patch 里还残留旧档位（off/max），调用层统一归一化，不污染 DEFAULTS。
-  cfg.chatEffort = normalizeEffortForSwitch(cfg.chatEffort) || 'light';
-  cfg.workEffort = normalizeEffortForSwitch(cfg.workEffort) || 'deep';
   // ── 功能二（v0.5.1）：手动锁定 work 模型 ──
   // 锁成立 ⇒ work 目标 = 手动 pair，跳过动态排行榜（refreshLeaderboard/ensureFresh 直接 return，
   // lbFetchCount 保持 0），日志 reason=manual-work-model-locked。
-  // let + syncManualLock()：自测 t11/t12 运行时改 cfg 后重算（生产一次性，无运行时改需求）。
+  // let + syncManualLock()：自测 t11/t12 运行时改 cfg 后重算；生产由 reloadCfg 重算。
+  // v0.7.5：legacy manualWorkModelLocked 在场走 legacy；cfg 被直接置 true（自测 t11）保留；
+  // 否则按新字段派生（workMode==='manual' + manualWorkModel 非空即锁）。
   let manualLock = { on: false, provider: '', model: '' };
   const syncManualLock = () => {
+    let locked = cfg.manualWorkModelLocked;
+    const legacyLocked = getRaw('manualWorkModelLocked');
+    if (legacyLocked !== undefined) locked = legacyLocked;
+    else if (locked !== true) {
+      try { locked = String(cfg.workMode ?? '') === 'manual' && String(cfg.manualWorkModel ?? '').trim() !== ''; }
+      catch { locked = false; }
+    }
     manualLock = parseManualWorkLock({
-      locked: cfg.manualWorkModelLocked,
+      locked,
       modelRef: cfg.manualWorkModel,
       fallbackProvider: cfg.workProvider,
     });
@@ -131,6 +209,20 @@ export function apply(ctx, config = {}) {
     }
   };
   syncManualLock();
+  // v0.7.5：设置页改值即时生效（官方 pi-ai / speech-to-text 同款 loader/volatile-update）。
+  // 重算 cfg + dynamicOn + manualLock；失败保持旧配置（绝不把路由置空）。
+  // 旧宿主无该事件时吞掉 = 一次性快照（行为与旧版一致）。
+  function reloadCfg(reason = '') {
+    try {
+      cfg = buildCfg();
+      dynamicOn = cfg.enableDynamicRanking !== false;
+      syncManualLock();
+      safeLog(ctx, 'info', `config reloaded (${reason || 'volatile-update'}): workMode=${cfg.workMode} chatMode=${cfg.chatMode} dynamic=${dynamicOn} lock=${manualLock.on}.`);
+    } catch { /* reload 失败保持旧配置 */ }
+  }
+  try {
+    if (typeof ctx?.on === 'function') ctx.on('loader/volatile-update', () => reloadCfg('volatile-update'));
+  } catch { /* 旧宿主无该事件 */ }
 
   // ── v0.5.3：已知干活对（reclaimUnknownModel 判定用，全部来自配置，零硬编码）──
   // 只收"配置里点名的"干活 pair（workModel/workModelFallback/生效的手动锁）。
@@ -189,6 +281,21 @@ export function apply(ctx, config = {}) {
   // ── 动态工作模型（联网排行榜，1h 缓存；同步读、后台刷，绝不阻塞工具链）──
   // 数据源：OpenRouter ?sort=most-popular；交集 = our-free-model 当前可用清单。
   const lb = createLeaderboardCache();
+  // v0.7.5：rankingRefreshSeconds 驱动刷新节拍（默认 3600s = CACHE_TTL_MS，行为与旧版一致）。
+  // clamp 30–3600 与 schema min/max 对齐；文件缓存仍走 1h（loadRankCache 内部 TTL）。
+  const rankTtlMs = () => {
+    try {
+      const s = Number(cfg?.rankingRefreshSeconds);
+      const clamped = Number.isFinite(s) ? Math.min(3600, Math.max(30, s)) : 3600;
+      return clamped * 1000;
+    } catch { return CACHE_TTL_MS; }
+  };
+  const lbStale = () => {
+    try {
+      if (!lb.get()) return true;
+      return Date.now() - lb.meta().at > rankTtlMs();
+    } catch { try { return lb.isStale(); } catch { return false; } }
+  };
   const freeList = { ids: null, avail: null, at: 0 }; // 我方清单（内存缓存）
   const FREE_LIST_TTL_MS = 60 * 1000;                 // 可用清单 60s 刷新（上游会变）
   let lbErrLoggedAt = 0;                              // 降级日志限频（避免刷屏/限流）
@@ -273,7 +380,7 @@ export function apply(ctx, config = {}) {
       const ids = await fetchRankOrder({ url: OR_URL });
       if (ids) {
         lb.set(ids);
-        safeLog(ctx, 'info', `leaderboard refreshed: ${ids.length} ranked models (ttl ${Math.round(CACHE_TTL_MS / 60000)}min).`);
+        safeLog(ctx, 'info', `leaderboard refreshed: ${ids.length} ranked models (ttl ${Math.round(rankTtlMs() / 60000)}min).`);
         // v0.7.0: 落盘 1h 文件缓存，供下次启动热读（失败静默，绝不影响主流程）。
         rankCachePath().then((p) => saveRankCache(p, ids)).catch(() => {});
       } else {
@@ -331,7 +438,7 @@ export function apply(ctx, config = {}) {
     .then(() => modeStore.hydrate())
     .then((n) => { if (n > 0) safeLog(ctx, 'info', 'session-mode sidecar loaded: ' + n + ' session(s).'); })
     .then(() => refreshFreeList())
-    .then(() => { if (lb.isStale()) return refreshLeaderboard(); })
+    .then(() => { if (lbStale()) return refreshLeaderboard(); })
     .catch(() => {});
 
   // 过期检查（fire-and-forget）：清单 60s / 排行榜 1h。
@@ -340,7 +447,7 @@ export function apply(ctx, config = {}) {
     try {
       const now = Date.now();
       if (now - freeList.at > FREE_LIST_TTL_MS) refreshFreeList().catch(() => {});
-      if (lb.isStale() && !lb.meta().inflight) refreshLeaderboard().catch(() => {});
+      if (lbStale() && !lb.meta().inflight) refreshLeaderboard().catch(() => {});
     } catch { /* noop */ }
   }
 
