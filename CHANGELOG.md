@@ -12,6 +12,8 @@ FreeTierError 应对 + 排行榜补完（m00002 规格）：
 - **接线**：`currentWorkModel()` 动态路径失败（榜空/清单空/交集空/异常/`enableDynamicRanking=false`）统一走 `pickWorkModelFromChain`；降级日志改报链头。
 - **本地文件缓存**：新增 `loadRankCache` / `saveRankCache`（`.cache/rankings.json` 相对 DSH_HOME，`{ts,ids}`、1h TTL、损坏即当没有、IO 失败静默）；启动预热先读文件缓存（新鲜直接进内存），榜单只在过期时打上游（少一次冷启动请求）；刷新成功落盘。
 - **修 `fetchRankOrder` 作用域 bug**：`let timer` 原在 try 块内、`finally` 引用 → 每次调用抛 `ReferenceError: timer is not defined`（5 个用例全红）。移出到函数级。
+- **补 v0.7.0 测试覆盖（13 例，85 → 98 全绿）**：`DEFAULT_WORK_MODEL_PRIORITY` 常量与冻结态、`pickWorkModelFromChain` 六态（链头命中/顺序跳过/全不中回退/空链/清单未就绪/原写法保留）、`loadRankCache` 五态（round-trip/缺文件/过期/损坏/缺 ts/空 ids）、`saveRankCache` 三态（拒绝空 ids 与空路径）、`DEFAULTS.workModelPriority` 单一事实源断言、crash 集成级链接线（隔离 DSH_HOME 夹具 + `enableDynamicRanking:false`，链头不可用时真切到链第二位，证明接线而非单值回退）。
+- **修 `pickWorkModelFromChain` 匹配 bug（新测试逮出）**：实现原是精确 Set 查找（`availNorm.has`），与注释承诺的两级匹配不符——`deepseek-v4-flash` 对不上清单里的 `deepseek-v4-flash-0731`。改为与 `rankIntersection` 同一套 `matchesNorm`（等值或前缀），仍返回链上原写法。
 - **测试**：npm test 85 全绿（router 35 / crash 31 / leaderboard 19），`FAIL` 0，exit 0。
 - **生产状态不变**：`cordis.patch.yml` 仍 `disabled: true`，不部署。
 

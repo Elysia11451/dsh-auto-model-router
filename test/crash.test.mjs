@@ -349,6 +349,40 @@ await t('lock enabled with empty manualWorkModel is inert', async () => {
   assert.equal(calls[0].model, 'mimo-v2.6-flash-free', 'empty manual value must fall back to dynamic/fallback');
 });
 
+// v0.7.0 静态降级链接线：enableDynamicRanking=false + 隔离 DSH_HOME 清单夹具 ——
+// 链头不可用时必须走链第二位（证明 currentWorkModel → pickWorkModelFromChain 接线，而非单值回退）。
+await t('static chain walks to second entry when head unavailable (v0.7.0 wiring)', async () => {
+  const fsP = await import('node:fs/promises');
+  const osP = await import('node:os');
+  const pathP = await import('node:path');
+  const home = await fsP.mkdtemp(pathP.join(osP.tmpdir(), 'router-chain-fixture-'));
+  await fsP.mkdir(pathP.join(home, 'our-free-model'), { recursive: true });
+  // 夹具清单：链头 mimo 不在可用列表，第二位 glm 可用
+  await fsP.writeFile(pathP.join(home, 'our-free-model', 'catalog.json'),
+    JSON.stringify({ entries: ['glm-5.3-flash-free', 'deepseek-v4-flash-free'] }));
+  await fsP.writeFile(pathP.join(home, 'our-free-model', 'availability.json'),
+    JSON.stringify({ results: { 'glm-5.3-flash-free': { state: 'available' }, 'deepseek-v4-flash-free': { state: 'available' } } }));
+  const prevHome = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  try {
+    const { ctx, handlers, calls } = makeCtx();
+    apply(ctx, {
+      enableDynamicRanking: false,
+      workModelPriority: ['mimo-v2.6-flash-free', 'glm-5.3-flash', 'deepseek-v4.1-flash'],
+    });
+    // 清单加载是 apply 内 fire-and-forget：等它读完夹具文件
+    await new Promise((r) => setTimeout(r, 300));
+    const exec = { args: '帮我装插件', agent: { session: 'session-chain-v070', source: {} } };
+    await runPre(handlers, exec);
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].provider, 'our-free-model');
+    assert.equal(calls[0].model, 'glm-5.3-flash', 'head unavailable → chain entry #2, not single fallback');
+  } finally {
+    if (prevHome === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = prevHome;
+  }
+});
+
 // v0.5.1 来源判定（lastSwitch 台账）：路由自己切出的 durable 态 → 允许继续四象限路由
 await t('router-made selection allows re-routing (ledger match)', async () => {
   const { ctx, handlers, calls } = makeCtx();

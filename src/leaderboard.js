@@ -235,10 +235,12 @@ export function pickWorkModelFromChain({ chain, availableIds, fallback = DEFAULT
     const avail = Array.isArray(availableIds) ? availableIds : [];
     // 清单未就绪或全不可用：不阻塞，直接回退（调用方已同步触发后台补拉）。
     if (avail.length === 0) return fb;
-    const availNorm = new Set(avail.map((m) => normalizeId(m)).filter((m) => m.length > 0));
+    // 两级匹配：归一化后等值或一端为另一端前缀（与 rankIntersection 同一套 matchesNorm），
+    // 配置写全名/裸名/带前缀（如 deepseek-v4-flash ↔ 清单里的 deepseek-v4-flash-0731）都能对上。
+    const availNorms = avail.map((m) => normalizeId(m)).filter((m) => m.length > 0);
     for (const want of list) {
       const n = normalizeId(want);
-      if (n && availNorm.has(n)) return want.trim();
+      if (n && availNorms.some((a) => matchesNorm(a, n))) return want.trim();
     }
     return fb;
   } catch {

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { classifyTask, sourceFromMeta, isGroupMeta, isSameKind, decideRoute, buildGroupHint, normalizeEffortForSwitch, buildSelectModelPayload, resolveChatTarget, parseManualWorkLock, isColdStartCrossKind, isUnknownDrift, isWorkModelRef, DEFAULTS } from '../src/router.js';
+import { DEFAULT_WORK_MODEL_PRIORITY } from '../src/leaderboard.js';
 
 const t = (name, fn) => { try { fn(); console.log(`ok - ${name}`); } catch (e) { console.error(`FAIL - ${name}: ${e.message}`); process.exitCode = 1; } };
 
@@ -94,6 +95,10 @@ t('defaults point at free work model', () => {
   assert.equal(DEFAULTS.privateChatWorkStrategy, 'free');
   assert.equal(DEFAULTS.workEffort, 'deep');
   assert.equal(DEFAULTS.chatEffort, 'light');
+});
+t('defaults carry v0.7.0 static work chain (single source of truth)', () => {
+  assert.deepEqual([...DEFAULTS.workModelPriority], ['mimo-v2.6-flash-free', 'glm-5.3-flash', 'deepseek-v4.1-flash']);
+  assert.deepEqual([...DEFAULTS.workModelPriority], [...DEFAULT_WORK_MODEL_PRIORITY], 'DEFAULTS 链必须与 leaderboard 导出一致');
 });
 t('legacy ui efforts normalize to adapter ids', () => {
   assert.equal(normalizeEffortForSwitch('max'), 'deep');

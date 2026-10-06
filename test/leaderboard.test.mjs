@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { normalizeId, rankIntersection, pickTop, fetchRankOrder, createLeaderboardCache, OR_URL, CACHE_TTL_MS, DEFAULT_WORK_MODEL } from '../src/leaderboard.js';
+import { normalizeId, rankIntersection, pickTop, fetchRankOrder, createLeaderboardCache, pickWorkModelFromChain, loadRankCache, saveRankCache, OR_URL, CACHE_TTL_MS, DEFAULT_WORK_MODEL, DEFAULT_WORK_MODEL_PRIORITY } from '../src/leaderboard.js';
 
 const t = (name, fn) => { try { fn(); console.log(`ok - ${name}`); } catch (e) { console.error(`FAIL - ${name}: ${e.message}`); process.exitCode = 1; } };
 const ta = async (name, fn) => { try { await fn(); console.log(`ok - ${name}`); } catch (e) { console.error(`FAIL - ${name}: ${e.message}`); process.exitCode = 1; } };
@@ -144,4 +144,101 @@ t('cache setError recorded', () => {
 
 t('default fallback model constant', () => {
   assert.equal(DEFAULT_WORK_MODEL, 'mimo-v2.6-flash-free');
+});
+
+// ── v0.7.0 静态降级链 ──
+t('DEFAULT_WORK_MODEL_PRIORITY is the frozen 3-model static chain', () => {
+  assert.deepEqual([...DEFAULT_WORK_MODEL_PRIORITY], ['mimo-v2.6-flash-free', 'glm-5.3-flash', 'deepseek-v4.1-flash']);
+  assert.equal(Object.isFrozen(DEFAULT_WORK_MODEL_PRIORITY), true);
+});
+
+t('chain picks head when head is available', () => {
+  const got = pickWorkModelFromChain({
+    chain: ['mimo-v2.6-flash-free', 'glm-5.3-flash', 'deepseek-v4.1-flash'],
+    availableIds: ['mimo-v2.6-flash-free', 'glm-5.3-flash'],
+    fallback: 'fb',
+  });
+  assert.equal(got, 'mimo-v2.6-flash-free');
+});
+
+t('chain walks in priority order skipping unavailable', () => {
+  const got = pickWorkModelFromChain({
+    chain: ['mimo-v2.6-flash-free', 'glm-5.3-flash', 'deepseek-v4.1-flash'],
+    availableIds: ['deepseek-v4-flash-free', 'glm-5.3-flash-free'], // 头两个都不可用
+    fallback: 'fb',
+  });
+  assert.equal(got, 'glm-5.3-flash');
+});
+
+t('chain falls back when nothing matches or list not ready', () => {
+  const chain = ['mimo-v2.6-flash-free', 'glm-5.3-flash'];
+  assert.equal(pickWorkModelFromChain({ chain, availableIds: ['someone-else-free'], fallback: 'fb' }), 'fb');
+  assert.equal(pickWorkModelFromChain({ chain, availableIds: [], fallback: 'fb' }), 'fb', '清单未就绪 = 回退');
+  assert.equal(pickWorkModelFromChain({ chain, availableIds: null, fallback: 'fb' }), 'fb');
+  assert.equal(pickWorkModelFromChain({ chain: [], availableIds: ['mimo-v2.6-flash-free'], fallback: 'fb' }), 'fb', '空链 = 回退');
+  assert.equal(pickWorkModelFromChain({ chain: null, availableIds: null, fallback: 'fb' }), 'fb');
+});
+
+t('chain two-level normalize match with original spelling kept', () => {
+  // 带机构前缀的配置写法照样对上清单裸名，返回链上的原写法（供 selectModel 下发）
+  const got = pickWorkModelFromChain({
+    chain: ['z-ai/glm-5.3-flash', 'deepseek-v4-flash'],
+    availableIds: ['glm-5.3-flash-free', 'deepseek-v4-flash-0731'],
+    fallback: 'fb',
+  });
+  assert.equal(got, 'z-ai/glm-5.3-flash', '返回链上原写法');
+});
+
+t('chain does not false-match deepseek-v4.1 vs v4', () => {
+  const got = pickWorkModelFromChain({
+    chain: ['deepseek-v4.1-flash'],
+    availableIds: ['deepseek-v4-flash-free'], // 第 11 位 '.' vs 'f' 分叉
+    fallback: 'fb',
+  });
+  assert.equal(got, 'fb');
+  const got2 = pickWorkModelFromChain({
+    chain: ['deepseek-v4-flash'],
+    availableIds: ['deepseek-v4-flash-0731'], // 前缀成立
+    fallback: 'fb',
+  });
+  assert.equal(got2, 'deepseek-v4-flash');
+});
+
+// ── v0.7.0 本地文件缓存（.cache/rankings.json）──
+const os = await import('node:os');
+const fs = await import('node:fs/promises');
+const path = await import('node:path');
+const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rank-cache-test-'));
+
+await ta('file cache round-trip save then load', async () => {
+  const p = path.join(tmpDir, 'rankings.json');
+  assert.equal(await saveRankCache(p, ['m1', 'm2']), true);
+  assert.deepEqual(await loadRankCache(p), ['m1', 'm2']);
+});
+
+await ta('file cache missing file / bad path -> null', async () => {
+  assert.equal(await loadRankCache(path.join(tmpDir, 'nope.json')), null);
+  assert.equal(await loadRankCache(null), null);
+});
+
+await ta('file cache expired (past 1h) -> null', async () => {
+  const p = path.join(tmpDir, 'expired.json');
+  await fs.writeFile(p, JSON.stringify({ ts: Date.now() - CACHE_TTL_MS - 1000, ids: ['m1'] }), 'utf8');
+  assert.equal(await loadRankCache(p), null);
+});
+
+await ta('file cache malformed / missing ts / empty ids -> null', async () => {
+  const p = path.join(tmpDir, 'bad.json');
+  await fs.writeFile(p, 'not-json{', 'utf8');
+  assert.equal(await loadRankCache(p), null, '损坏即当没有');
+  await fs.writeFile(p, JSON.stringify({ ids: ['m1'] }), 'utf8');
+  assert.equal(await loadRankCache(p), null, '缺 ts');
+  await fs.writeFile(p, JSON.stringify({ ts: Date.now(), ids: [] }), 'utf8');
+  assert.equal(await loadRankCache(p), null, '空 ids');
+});
+
+await ta('file cache save rejects empty ids and null path', async () => {
+  assert.equal(await saveRankCache(path.join(tmpDir, 'empty.json'), []), false);
+  assert.equal(await saveRankCache(null, ['m1']), false);
+  assert.equal(await saveRankCache(path.join(tmpDir, 'empty.json'), null), false);
 });
