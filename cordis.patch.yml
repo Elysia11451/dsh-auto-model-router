@@ -22,3 +22,5 @@
         hintCooldownMs: 300000
         switchCooldownMs: 5000
         reclaimUnknownModel: true
+        firstTurnPrompt: true
+        firstTurnPromptTimeoutMs: 60000

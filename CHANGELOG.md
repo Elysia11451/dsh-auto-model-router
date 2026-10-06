@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.8.0] - 2026-10-06
+
+### Added
+- First-turn mode prompt (src/index.js:1262-1346): new-session first human message defaults chat, async userQuestions.ask carries live agent (child-agent guard via agents.roots), Work answer corrects to work from next round; group chat skips prompt, timeout 60s falls back to chat
+- 2 volatile Config keys: firstTurnPrompt (default true), firstTurnPromptTimeoutMs (default 60000); cordis.patch.yml synced to 17 keys; settings page rows wired (src/client.js:55-58,108-111,327-328)
+- Directional cooldown (src/index.js:752-767): chat→work upgrade bypasses switchCooldownMs (reason=upgrade-bypass-cooldown), downgrade/same-lane still gated (reason=downgrade-cooldown-blocked)
+- test/first-turn.test.mjs: 6 mock cases for prompt branches (work-answer/chat-answer/no-provider/timeout/group/disabled); wired into npm test (5 suites, 133 tests total)
+
+### Fixed
+- crash.test.mjs 8 cases updated to two-round assertions (v0.8.0 first-turn default-chat semantics: T1 primes ledger, T2 asserts original intent); waitLine polling replaces fixed 50ms sleep for JSONL async flush (flake eliminated, 5x consecutive green)
+
+### Known limitations
+- First-turn prompt is experimental: delivery depends on Web answerer routing live Agent scope; NO_PROVIDER / CALLER_NOT_LIVE / DELEGATED_CALLER all degrade to chat silently. Production QQ verification pending (new code not yet installed to running DSH at commit time)
+
 ## [0.7.8] - 2026-10-06
 
 ### Fixed

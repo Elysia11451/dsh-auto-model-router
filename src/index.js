@@ -70,6 +70,11 @@ export const Config = Schema.object({
     .description({ zh: '同一会话连续切换冷却（毫秒）。切得太频繁被吞时调小', en: 'Per-session switch cooldown in ms; lower it when rapid switches get swallowed' }),
   reclaimUnknownModel: Schema.boolean().default(true).volatile()
     .description({ zh: '未知漂移纠偏。开：当前模型既非聊天目标也非干活配置时强制放回路由目标；关：不认识就不动', en: 'Reclaim unknown drift. On: force back to route target; off: leave unknown models alone' }),
+  // —— 分组 F · 首轮弹窗（v0.8.0，默认展开）——
+  firstTurnPrompt: Schema.boolean().default(true).volatile()
+    .description({ zh: '首轮弹窗选择模式。开：新会话首条真人消息弹窗选 Chat/Work；关：默认 Chat 档不弹窗', en: 'First-turn mode prompt. On: ask Chat/Work on new session first message; off: default chat, no prompt' }),
+  firstTurnPromptTimeoutMs: Schema.number().default(60000).volatile()
+    .description({ zh: '首轮弹窗超时（毫秒）。超时回退默认 Chat 档', en: 'First-turn prompt timeout in ms; falls back to chat on timeout' }),
   // —— 隐藏键（隔离自测专用，非 volatile + hidden，不进表单）——
   selftest: Schema.union([Schema.boolean(), Schema.string()]).default(false).hidden(true)
     .description({ zh: '隔离自测开关（仅隔离环境配置；生产不配置该键）', en: 'Isolation selftest switch (isolated env only; not set in production)' }),
@@ -169,6 +174,9 @@ export function apply(ctx, config = {}) {
     c.hintCooldownMs = pick('hintCooldownMs', DEFAULTS.hintCooldownMs);
     c.switchCooldownMs = pick('switchCooldownMs', 5000);
     c.reclaimUnknownModel = pick('reclaimUnknownModel', true);
+    // F 首轮弹窗（v0.8.0）
+    c.firstTurnPrompt = pick('firstTurnPrompt', true);
+    c.firstTurnPromptTimeoutMs = pick('firstTurnPromptTimeoutMs', 60000);
     // 隐藏自测键（plain，非 volatile）
     c.selftest = pick('selftest', false);
     c.selftestRound = pick('selftestRound', '');
@@ -742,12 +750,20 @@ export function apply(ctx, config = {}) {
       }
     } catch { /* 读回失败不影响后续 */ }
     // 节流：同一会话冷却内不重复切（默认 5s，可配 switchCooldownMs；旧 60s 会吞连续纠偏）
+    // v0.7.8 方向区分：升档（chat→work，含 routeMode==='work'）跳过冷却立即放行；
+    // 降档（work→chat）与同档切换仍受冷却约束。routeMode 由调用方透传（pre-step/pre-execute/runRoute）。
+    const __routeMode = String(target?.__routeMode ?? routeMode ?? '');
+    const __isUpgrade = __routeMode === 'work';
     const cooldownMs = Number.isFinite(Number(cfg?.switchCooldownMs)) ? Number(cfg.switchCooldownMs) : 5000;
     try {
       const last = switchState.get(sid);
-      if (last && Date.now() - last < cooldownMs) {
-        safeLog(ctx, 'warn', `${tag} | early-return reason=cooldown (${Date.now() - last}ms since last switch)`);
-        return { ok: false, reason: 'cooldown', target };
+      if (!__isUpgrade && last && Date.now() - last < cooldownMs) {
+        const __remain = cooldownMs - (Date.now() - last);
+        safeLog(ctx, 'warn', `${tag} | early-return reason=downgrade-cooldown-blocked (${Date.now() - last}ms since last switch; remain=${__remain}ms)`);
+        return { ok: false, reason: 'downgrade-cooldown-blocked', target };
+      }
+      if (__isUpgrade && last && Date.now() - last < cooldownMs) {
+        safeLog(ctx, 'info', `${tag} | reason=upgrade-bypass-cooldown (${Date.now() - last}ms since last switch; chat->work instant)`);
       }
     } catch { /* Map 异常不阻断 */ }
     // 切前记住全局默认：用前重取（宿主回收后旧引用失效），拦截生效时仅用于断言
@@ -1243,10 +1259,91 @@ export function apply(ctx, config = {}) {
         const pending = hasPendingToolCalls(msgs);         // 任务进行中 → 冻结降档
         let st = await modeStore.read(sid);                // Map 优先，缺失读侧车（幂等 hydrate）
         if (!st) {
-          // 无状态新会话首轮：v0.7.8 按 source 区分初始档（main 强制 work；im/群沿用关键词预判）
-          const first = source === 'main' ? 'work' : (kwHit ? 'work' : 'chat');
-          modeStore.set(sid, { mode: first, chatTurns: 0, reason: 'first-round-predict' });
-          st = { mode: first, chatTurns: 0 };
+          // v0.8.0 首轮弹窗（异步纠正）：新会话首轮先默认 chat 放行，弹窗答案回来再纠正。
+          // 口径锁定：getService(ctx,'userQuestions') + 带 live agent + 不 await + 群聊不弹。
+          // v0.7.8 旧预判 fallback（保留作安全网，弹窗验证通过前不删）：
+          //   const first = source === 'main' ? 'work' : (kwHit ? 'work' : 'chat');
+          // 现默认 chat 放行，第二轮关键词升档（keyword-upgrade）自然纠正；旧分支仅注释保留。
+          if (isGroupMeta(meta)) {
+            modeStore.set(sid, { mode: 'chat', chatTurns: 0, reason: 'first-turn-group-default' });
+            st = { mode: 'chat', chatTurns: 0 };
+          } else if (cfg.firstTurnPrompt === false) {
+            modeStore.set(sid, { mode: 'chat', chatTurns: 0, reason: 'first-turn-disabled' });
+            st = { mode: 'chat', chatTurns: 0 };
+          } else {
+            modeStore.set(sid, { mode: 'chat', chatTurns: 0, reason: 'first-turn-pending' });
+            st = { mode: 'chat', chatTurns: 0 };
+            try {
+              const __svc = getService(ctx, 'userQuestions');
+              if (!__svc || typeof __svc.ask !== 'function') {
+                modeStore.set(sid, { mode: 'chat', chatTurns: 0, reason: 'first-turn-no-provider' });
+                try { safeLog(ctx, 'info', `first-turn prompt skipped for session ${sid} (reason=first-turn-no-provider).`); } catch { /* noop */ }
+              } else {
+                const __ctl = new AbortController();
+                let __ms = Number(cfg.firstTurnPromptTimeoutMs);
+                if (!Number.isFinite(__ms) || __ms <= 0) __ms = 60000;
+                const __timer = setTimeout(() => { try { __ctl.abort(); } catch { /* noop */ } }, __ms);
+                if (typeof __timer.unref === 'function') try { __timer.unref(); } catch { /* noop */ }
+                try { safeLog(ctx, 'info', `first-turn prompt asked for session ${sid} (timeout=${__ms}ms).`); } catch { /* noop */ }
+                // v0.8.0 指令：必须带 live agent，否则 Web 应答器收不到（NO_PROVIDER）。
+                // payload.agent = pre-step 的 live runtime root；child agent 会被拒（DELEGATED_CALLER→降级 chat）。
+                // 前置检查：child agent 不传 agent，走降级避免 DELEGATED_CALLER。
+                // 根因：userQuestions 要求 exact live runtime root，child 会被 DELEGATED_CALLER 拒绝。
+                // 保护：仅当能确认为 child（agents.roots() 非空且不含 agent）时才跳过；roots 空/异常不误判。
+                let __isChildAgent = false;
+                try {
+                  const __agentsSvc = getService(ctx, 'agents');
+                  if (agent && __agentsSvc && typeof __agentsSvc.roots === 'function') {
+                    const __roots = __agentsSvc.roots();
+                    if (Array.isArray(__roots) && __roots.length > 0) __isChildAgent = !__roots.includes(agent);
+                  }
+                } catch { __isChildAgent = false; }
+                const __req = {
+                  questions: [{
+                    id: 'init-mode',
+                    question: '本轮对话请选择模式',
+                    header: '模式选择',
+                    options: [
+                      { label: 'Chat 档（省钱模式）', description: '闲聊、日常对话，使用自有 API，成本最低' },
+                      { label: 'Work 档（能力模式）', description: '干活、调试、代码任务，使用免费池最强模型' },
+                    ],
+                  }],
+                  signal: __ctl.signal,
+                };
+                try {
+                  if (agent && !__isChildAgent) __req.agent = agent;
+                  else if (__isChildAgent) {
+                    try { safeLog(ctx, 'info', `first-turn prompt skipped for session ${sid} (reason=first-turn-child-agent; child has no answerer).`); } catch { /* noop */ }
+                  }
+                } catch { /* 无 agent 字段则降级为 agentless */ }
+                __svc.ask(__req).then((ans) => {
+                  try { clearTimeout(__timer); } catch { /* noop */ }
+                  let selected = '';
+                  try { selected = ans?.answers?.[0]?.selected?.[0] ?? ans?.answers?.[0]?.answer ?? ''; } catch { selected = ''; }
+                  if (String(selected).includes('Work')) {
+                    modeStore.set(sid, { mode: 'work', chatTurns: 0, reason: 'first-turn-prompt' });
+                    try { safeLog(ctx, 'info', `first-turn prompt answered for session ${sid}: work (reason=first-turn-prompt).`); } catch { /* noop */ }
+                  } else {
+                    modeStore.set(sid, { mode: 'chat', chatTurns: 0, reason: 'first-turn-prompt-chat' });
+                    try { safeLog(ctx, 'info', `first-turn prompt answered for session ${sid}: chat (reason=first-turn-prompt-chat).`); } catch { /* noop */ }
+                  }
+                }).catch((err) => {
+                  try { clearTimeout(__timer); } catch { /* noop */ }
+                  const code = err?.code ?? err?.name ?? '';
+                  const msg = String(err?.message ?? err ?? '');
+                  // v0.8.0 指令：NO_PROVIDER / CALLER_NOT_LIVE / DELEGATED_CALLER 统一降级 chat，不阻塞。
+                  const reason = code === 'NO_PROVIDER' ? 'first-turn-no-provider'
+                    : (code === 'ASK_TIMED_OUT' || code === 'TimeoutError' ? 'first-turn-timeout'
+                    : (code === 'ASK_ABORTED' || code === 'AbortError' ? 'first-turn-aborted'
+                    : (/DELEGATED_CALLER|owned by another|child agent/i.test(msg + code) ? 'first-turn-prompt-failed'
+                    : (/CALLER_NOT_LIVE|not.*live|live.*agent|runtime root/i.test(msg + code) ? 'first-turn-prompt-failed'
+                    : 'first-turn-error'))));
+                  modeStore.set(sid, { mode: 'chat', chatTurns: 0, reason });
+                  try { safeLog(ctx, 'info', `first-turn prompt settled for session ${sid}: chat (reason=${reason}; err=${String(code || err?.message || err).slice(0, 120)}).`); } catch { /* noop */ }
+                });
+              }
+            } catch { /* 弹窗失败保持 chat */ }
+          }
         } else {
           // v0.7.2 修正（turn 计数）：降档计数按真人 turn 结算。
           // 本分支每真人 turn 只进一次（stepRouted 按 sid|turn|textSig 去重），语义 = 一个 turn。

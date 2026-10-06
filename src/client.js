@@ -52,6 +52,10 @@ window.__ModuleLoader__.load({
       switchCooldownMsHint: 'Per-session switch cooldown; lower when rapid switches get swallowed.',
       reclaimUnknownModel: 'Reclaim unknown drift',
       reclaimUnknownModelHint: 'On: force unknown models back to the route target; off: leave unknown alone.',
+      firstTurnPrompt: 'First-turn mode prompt',
+      firstTurnPromptHint: 'On: ask Chat/Work on new session first message; off: default chat, no prompt.',
+      firstTurnPromptTimeoutMs: 'First-turn prompt timeout (ms)',
+      firstTurnPromptTimeoutMsHint: 'Falls back to chat on timeout.',
       overridden: 'Overridden',
       reset: 'Reset to default',
       readOnly: 'This deployment stores settings read-only.',
@@ -101,6 +105,10 @@ window.__ModuleLoader__.load({
       switchCooldownMsHint: '同一会话连续切换冷却；切得太频繁被吞时调小。',
       reclaimUnknownModel: '未知漂移纠偏',
       reclaimUnknownModelHint: '开：当前模型两头都不认识时强制放回路由目标；关：不认识就不动。',
+      firstTurnPrompt: '首轮弹窗选择模式',
+      firstTurnPromptHint: '开：新会话首条真人消息弹窗选 Chat/Work；关：默认 Chat 档不弹窗。',
+      firstTurnPromptTimeoutMs: '首轮弹窗超时（毫秒）',
+      firstTurnPromptTimeoutMsHint: '超时回退默认 Chat 档。',
       overridden: '已覆盖',
       reset: '恢复默认',
       readOnly: '本部署的设置为只读。',
@@ -316,6 +324,8 @@ window.__ModuleLoader__.load({
                 textRow(jsx, t, props, state, 'hintCooldownMs', disabled, true),
                 textRow(jsx, t, props, state, 'switchCooldownMs', disabled, true),
                 boolRow(jsx, t, props, state, 'reclaimUnknownModel', disabled),
+                boolRow(jsx, t, props, state, 'firstTurnPrompt', disabled),
+                textRow(jsx, t, props, state, 'firstTurnPromptTimeoutMs', disabled, true),
               ],
             }),
           }),
@@ -354,6 +364,8 @@ window.__ModuleLoader__.load({
           (0, _primitives.settingsNumberField)('hintCooldownMs'),
           (0, _primitives.settingsNumberField)('switchCooldownMs'),
           booleanField('reclaimUnknownModel'),
+          booleanField('firstTurnPrompt'),
+          (0, _primitives.settingsNumberField)('firstTurnPromptTimeoutMs'),
         ]);
         this.store = this.form.bind(() => this.projection());
       }
@@ -379,6 +391,8 @@ window.__ModuleLoader__.load({
           hintCooldownMs: this.form.field('hintCooldownMs'),
           switchCooldownMs: this.form.field('switchCooldownMs'),
           reclaimUnknownModel: this.form.field('reclaimUnknownModel'),
+          firstTurnPrompt: this.form.field('firstTurnPrompt'),
+          firstTurnPromptTimeoutMs: this.form.field('firstTurnPromptTimeoutMs'),
         };
       }
       planFields() {

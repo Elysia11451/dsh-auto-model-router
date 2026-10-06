@@ -67,6 +67,17 @@ const withTmpLog = async (fn) => {
   finally { if (prev === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = prev; }
 };
 
+// v0.8.0 防 flake：JSONL 异步落盘 —— 轮询读取直到命中（25ms 间隔，3s 超时），替代固定 sleep
+const waitLine = async (readLines, pred, timeoutMs = 3000) => {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const hit = (await readLines()).find(pred);
+    if (hit) return hit;
+    if (Date.now() > deadline) return undefined;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+};
+
 const t = async (n, fn) => { try { await fn(); console.log(`ok - ${n}`); } catch (e) { console.error(`FAIL - ${n}: ${e.message}`); process.exitCode = 1; } };
 
 // 导出形态：具名 name/inject/apply（移动端强制 ['tools','llm']，多写即 PENDING）
@@ -200,6 +211,7 @@ await t('same-session switch throttled', async () => {
 });
 
 // 精确同类：投影恰为当前动态目标（回退值 mimo）-> 工作指令不重复切
+// v0.8.0 两轮断言：首轮默认 chat 放行（T1 切 chat），次轮 work 路由命中精确同类才保持
 await t('exact same model kept, not re-switched', async () => {
   await withTmpLog(async (readLines) => {
     const { ctx, handlers, calls } = makeCtx();
@@ -209,33 +221,41 @@ await t('exact same model kept, not re-switched', async () => {
     };
     ctx.sessions = { get: () => ({}) };
     apply(ctx, {});
-    const res = await runStep(handlers, { text: '帮我装插件', sid: 'session-manual', meta: {} });
+    const res = await runStep(handlers, { text: '帮我装插件', sid: 'session-manual', meta: {}, turn: 1 });
     assert.equal(res?.kind, 'allow');
     await new Promise((r) => setTimeout(r, 50));
-    assert.equal(calls.length, 0, 'exact same-kind must not call selectModel');
-    const decision = (await readLines()).find((l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-manual');
-    assert.ok(decision, 'decision line must exist');
+    await runStep(handlers, { text: '帮我装插件', sid: 'session-manual', meta: {}, turn: 2 });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(calls.length, 1, 'T1 first-turn chat switch only; T2 exact same-kind must not re-switch');
+    assert.equal(calls[0].provider, 'zai-coding-cn', 'T1 defaults to chat lane');
+    const decision = await waitLine(readLines,(l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-manual' && l.turn === 2);
+    assert.ok(decision, 'turn2 decision line must exist');
     assert.ok(decision.keepReason, 'must record a keep reason');
     assert.match(String(decision.actualSel ?? ''), /our-free-model/);
-    assert.equal(decision.switched, null, 'no switch issued');
+    assert.equal(decision.switched, null, 'no switch issued on T2');
   });
 });
 
 // v0.5.1 语义改写：手动 1.3 在位（durable pending）+ 工作指令目标动态最强 -> 绝不覆盖
+// v0.8.0 两轮断言：T1 首轮默认 chat（lastSwitch 为空→冷启动放行切 chat）；T2 work 路由遇 durable 手动才保持
 await t('durable manual selection never overridden (cross-model)', async () => {
   await withTmpLog(async (readLines) => {
     const { ctx, handlers, calls } = makeCtx();
-    ctx.sessionProjections = {
-      stateOf: () => ({ lastUsed: null, pending: { provider: 'our-free-model', model: 'muse-spark-1.3-contributor-free', reasoningEffort: 'deep' } }),
-    };
+    const proj = { pending: { provider: 'our-free-model', model: 'muse-spark-1.3-contributor-free', reasoningEffort: 'deep' } };
+    ctx.sessionProjections = { stateOf: () => ({ lastUsed: null, pending: proj.pending }) };
     ctx.sessions = { get: () => ({}) };
     apply(ctx, { reclaimUnknownModel: false }); // v0.5.3：守关闭纠偏时的手动优先（默认开启时未知1.3会被纠偏）
-    const res = await runStep(handlers, { text: '帮我装插件', sid: 'session-crossmodel', meta: {} });
+    const res = await runStep(handlers, { text: '帮我装插件', sid: 'session-crossmodel', meta: {}, turn: 1 });
     assert.equal(res?.kind, 'allow');
     await new Promise((r) => setTimeout(r, 50));
-    assert.equal(calls.length, 0, 'durable selection must block any switch');
-    const decision = (await readLines()).find((l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-crossmodel');
-    assert.ok(decision, 'decision line must exist');
+    // T1 落 chat 真切（lastSwitch 建立路由自有态），T2 恢复 durable 手动值再断言保持
+    assert.equal(calls.length, 1, 'T1 first-turn chat switch primes ledger');
+    proj.pending = { provider: 'our-free-model', model: 'muse-spark-1.3-contributor-free', reasoningEffort: 'deep' };
+    await runStep(handlers, { text: '帮我装插件', sid: 'session-crossmodel', meta: {}, turn: 2 });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(calls.length, 1, 'T2 durable manual selection must block any further switch');
+    const decision = await waitLine(readLines,(l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-crossmodel' && l.turn === 2);
+    assert.ok(decision, 'turn2 decision line must exist');
     assert.equal(decision.keepReason, 'user-manual-selection-kept');
     assert.notEqual(decision.switched, true, 'must not switch');
   });
@@ -243,6 +263,7 @@ await t('durable manual selection never overridden (cross-model)', async () => {
 
 // v0.5.2 语义更新：台账为空 + durable 停 chat 档 + 工作指令 → 跨类放行（不再保持）。
 // 原“durable chat kept”断言已过时（v0.5.1 语义），由“cold-start same lane”承接保守语义。
+// v0.8.0 两轮断言：T1 首轮默认 chat（同类保持 0 切）；T2 work 路由跨类放行（升档直通冷却）
 await t('durable chat selection rerouted under work command when ledger empty (cross-type, v0.5.2)', async () => {
   await withTmpLog(async (readLines) => {
     const { ctx, handlers, calls } = makeCtx();
@@ -251,12 +272,15 @@ await t('durable chat selection rerouted under work command when ledger empty (c
     };
     ctx.sessions = { get: () => ({}) };
     apply(ctx, {});
-    await runStep(handlers, { text: '帮我装插件', sid: 'session-cross', meta: {} });
+    await runStep(handlers, { text: '帮我装插件', sid: 'session-cross', meta: {}, turn: 1 });
     await new Promise((r) => setTimeout(r, 50));
-    assert.equal(calls.length, 1, 'cold-start cross-kind work must reroute from chat lane');
+    assert.equal(calls.length, 0, 'T1 first-turn chat same-kind stays kept (no switch)');
+    await runStep(handlers, { text: '帮我装插件', sid: 'session-cross', meta: {}, turn: 2 });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(calls.length, 1, 'T2 cold-start cross-kind work must reroute from chat lane');
     assert.equal(calls[0].provider, 'our-free-model');
-    const decision = (await readLines()).find((l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-cross');
-    assert.ok(decision, 'decision line must exist');
+    const decision = await waitLine(readLines,(l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-cross' && l.turn === 2);
+    assert.ok(decision, 'turn2 decision line must exist');
     assert.notEqual(decision.keepReason, 'user-manual-selection-kept');
     assert.equal(decision.switched, true, 'cross-kind reroute must switch');
   });
@@ -274,7 +298,7 @@ await t('same-kind chat kept', async () => {
     await runStep(handlers, { text: '今天天气怎么样', sid: 'session-chatkeep', meta: { channel: 'weixin' } });
     await new Promise((r) => setTimeout(r, 50));
     assert.equal(calls.length, 0, 'already on chat must not re-switch');
-    const decision = (await readLines()).find((l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-chatkeep');
+    const decision = await waitLine(readLines,(l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-chatkeep');
     assert.ok(decision, 'decision line must exist');
     assert.match(String(decision.actualSel ?? ''), /zai-coding-cn/);
     assert.ok(decision.keepReason, 'must record a keep reason');
@@ -330,17 +354,23 @@ await t('enableDynamicRanking=false never fetches OpenRouter', async () => {
 
 // durable request header（首条消息后即存在）同样构成手动优先，路由绝不覆盖
 // v0.5.3：关闭纠偏门（reclaimUnknownModel:false）守此语义 —— 默认开启时未知外来值会被纠偏收编。
+// v0.8.0 两轮断言：T1 首轮默认 chat 落真切建台账；T2 恢复 header 手动值再断言保持
 await t('durable request header blocks switching', async () => {
   await withTmpLog(async (readLines) => {
     const { ctx, handlers, calls } = makeCtx();
+    const hdr = { on: false };
     ctx.sessionProjections = { stateOf: () => ({ lastUsed: null, pending: null }) };
-    ctx.sessions = { get: () => ({ requestHeader: () => ({ config: { provider: 'our-free-model', model: 'muse-spark-1.3-contributor-free', reasoningEffort: 'deep' } }) }) };
+    ctx.sessions = { get: () => (hdr.on ? { requestHeader: () => ({ config: { provider: 'our-free-model', model: 'muse-spark-1.3-contributor-free', reasoningEffort: 'deep' } }) } : ({})) };
     apply(ctx, { reclaimUnknownModel: false });
-    await runStep(handlers, { text: '帮我装插件', sid: 'session-hdr', meta: {} });
+    await runStep(handlers, { text: '帮我装插件', sid: 'session-hdr', meta: {}, turn: 1 });
     await new Promise((r) => setTimeout(r, 50));
-    assert.equal(calls.length, 0, 'durable header must block any switch');
-    const decision = (await readLines()).find((l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-hdr');
-    assert.ok(decision, 'decision line must exist');
+    assert.equal(calls.length, 1, 'T1 first-turn chat switch primes ledger');
+    hdr.on = true;
+    await runStep(handlers, { text: '帮我装插件', sid: 'session-hdr', meta: {}, turn: 2 });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(calls.length, 1, 'T2 durable header must block any further switch');
+    const decision = await waitLine(readLines,(l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-hdr' && l.turn === 2);
+    assert.ok(decision, 'turn2 decision line must exist');
     assert.equal(decision.keepReason, 'user-manual-selection-kept');
     assert.notEqual(decision.switched, true, 'must not switch');
   });
@@ -355,7 +385,7 @@ await t('unreadable selection state keeps conservatively', async () => {
     await runStep(handlers, { text: '帮我装插件', sid: 'session-unreadable', meta: {} });
     await new Promise((r) => setTimeout(r, 50));
     assert.equal(calls.length, 0, 'unknown state must not switch');
-    const decision = (await readLines()).find((l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-unreadable');
+    const decision = await waitLine(readLines,(l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-unreadable');
     assert.ok(decision, 'decision line must exist');
     assert.equal(decision.keepReason, 'selection-state-unreadable');
   });
@@ -366,13 +396,18 @@ await t('manual work-model lock forces manual target', async () => {
   const { ctx, handlers, calls } = makeCtx();
   apply(ctx, { manualWorkModelLocked: true, manualWorkModel: 'our-free-model/muse-spark-1.3-contributor-free' });
   await withTmpLog(async (readLines) => {
-    await runStep(handlers, { text: '帮我装插件', sid: 'session-lockon', meta: {} });
+    // v0.8.0 两轮断言：T1 首轮默认 chat；T2 work 路由命中手动锁目标
+    await runStep(handlers, { text: '帮我装插件', sid: 'session-lockon', meta: {}, turn: 1 });
     await new Promise((r) => setTimeout(r, 50));
-    assert.equal(calls.length, 1);
-    assert.equal(calls[0].provider, 'our-free-model');
-    assert.equal(calls[0].model, 'muse-spark-1.3-contributor-free');
-    const decision = (await readLines()).find((l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-lockon');
-    assert.ok(decision, 'decision line must exist');
+    assert.equal(calls.length, 1, 'T1 first-turn chat switch expected');
+    assert.equal(calls[0].provider, 'zai-coding-cn', 'T1 defaults to chat lane');
+    await runStep(handlers, { text: '帮我装插件', sid: 'session-lockon', meta: {}, turn: 2 });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(calls.length, 2, 'T2 work route must issue manual-lock switch');
+    assert.equal(calls[1].provider, 'our-free-model');
+    assert.equal(calls[1].model, 'muse-spark-1.3-contributor-free');
+    const decision = await waitLine(readLines,(l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-lockon' && l.turn === 2);
+    assert.ok(decision, 'turn2 decision line must exist');
     assert.match(String(decision.target ?? ''), /muse-spark-1\.3-contributor-free/);
   });
 });
@@ -418,13 +453,16 @@ await t('static chain walks to second entry when head unavailable (v0.7.0 wiring
       enableDynamicRanking: false,
       workModelPriority: ['mimo-v2.6-flash-free', 'glm-5.3-flash', 'deepseek-v4.1-flash'],
     });
+    // v0.8.0 两轮断言：T1 首轮默认 chat；T2 状态机已 work → 静态链解析到第二位
     // 清单加载是 apply 内 fire-and-forget：等它读完夹具文件
     await new Promise((r) => setTimeout(r, 300));
-    await runStep(handlers, { text: '帮我装插件', sid: 'session-chain-v070', meta: {} });
+    await runStep(handlers, { text: '帮我装插件', sid: 'session-chain-v070', meta: {}, turn: 1 });
     await new Promise((r) => setTimeout(r, 50));
-    assert.equal(calls.length, 1);
-    assert.equal(calls[0].provider, 'our-free-model');
-    assert.equal(calls[0].model, 'glm-5.3-flash', 'head unavailable → chain entry #2, not single fallback');
+    await runStep(handlers, { text: '帮我装插件', sid: 'session-chain-v070', meta: {}, turn: 2 });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(calls.length, 2, 'T1 chat + T2 chain switch expected');
+    assert.equal(calls[1].provider, 'our-free-model');
+    assert.equal(calls[1].model, 'glm-5.3-flash', 'head unavailable → chain entry #2, not single fallback');
   } finally {
     if (prevHome === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = prevHome;
   }
@@ -448,7 +486,7 @@ await t('router-made selection allows re-routing (ledger match)', async () => {
     // 3) 状态机保持 chat 态 → 来源判定应放行（不报 user-manual），目标注解保留
     await runStep(handlers, { text: '帮我装插件', sid, turn: 2 });
     await new Promise((r) => setTimeout(r, 50));
-    const decision = (await readLines()).find((l) => l.tool === 'agent/pre-step/decision' && l.sid === sid && l.turn === 2);
+    const decision = await waitLine(readLines,(l) => l.tool === 'agent/pre-step/decision' && l.sid === sid && l.turn === 2);
     assert.ok(decision, 'decision line must exist');
     assert.ok(decision.target, 'ledger-matched state must not be treated as manual keep');
     assert.notEqual(decision.keepReason, 'user-manual-selection-kept');
@@ -470,7 +508,7 @@ await t('foreign selection kept even when ledger exists', async () => {
     proj.pending = { provider: 'our-free-model', model: 'muse-spark-1.3-contributor-free', reasoningEffort: 'deep' };
     await runStep(handlers, { text: '帮我装插件', sid, turn: 2 });
     await new Promise((r) => setTimeout(r, 50));
-    const decision = (await readLines()).find((l) => l.tool === 'agent/pre-step/decision' && l.sid === sid && l.turn === 2);
+    const decision = await waitLine(readLines,(l) => l.tool === 'agent/pre-step/decision' && l.sid === sid && l.turn === 2);
     assert.ok(decision, 'decision line must exist');
     assert.equal(decision.keepReason, 'user-manual-selection-kept');
     assert.notEqual(decision.switched, true, 'must not switch');
@@ -492,13 +530,14 @@ await t('cold-start empty ledger reroutes chat from work lane (not kept)', async
     assert.equal(calls.length, 1, 'cold-start cross-kind chat must switch, not keep');
     assert.equal(calls[0].provider, 'zai-coding-cn');
     assert.equal(calls[0].model, 'glm-5.3-flash');
-    const decision = (await readLines()).find((l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-cold-chat');
+    const decision = await waitLine(readLines,(l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-cold-chat');
     assert.ok(decision, 'decision line must exist');
     assert.notEqual(decision.keepReason, 'user-manual-selection-kept');
   });
 });
 
 // v0.5.2 冷启动跨类放行：台账为空 + durable 停 chat 档 → 工作指令必须真切到 work
+// v0.8.0 两轮断言：T1 首轮默认 chat 同类保持（0 切）；T2 work 路由跨类放行（升档直通冷却）
 await t('cold-start empty ledger reroutes work from chat lane (not kept)', async () => {
   const { ctx, handlers, calls } = makeCtx();
   ctx.sessionProjections = {
@@ -507,12 +546,15 @@ await t('cold-start empty ledger reroutes work from chat lane (not kept)', async
   ctx.sessions = { get: () => ({}) };
   apply(ctx, {});
   await withTmpLog(async (readLines) => {
-    await runStep(handlers, { text: '帮我装插件', sid: 'session-cold-work' });
+    await runStep(handlers, { text: '帮我装插件', sid: 'session-cold-work', turn: 1 });
     await new Promise((r) => setTimeout(r, 50));
-    assert.equal(calls.length, 1, 'cold-start cross-kind work must switch, not keep');
+    assert.equal(calls.length, 0, 'T1 first-turn chat same-kind stays kept (no switch)');
+    await runStep(handlers, { text: '帮我装插件', sid: 'session-cold-work', turn: 2 });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(calls.length, 1, 'T2 cold-start cross-kind work must switch, not keep');
     assert.equal(calls[0].provider, 'our-free-model');
-    const decision = (await readLines()).find((l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-cold-work');
-    assert.ok(decision, 'decision line must exist');
+    const decision = await waitLine(readLines,(l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-cold-work' && l.turn === 2);
+    assert.ok(decision, 'turn2 decision line must exist');
     assert.equal(decision.route, 'work');
     assert.notEqual(decision.keepReason, 'user-manual-selection-kept');
   });
@@ -561,7 +603,7 @@ await t('reclaim unknown model=true forces switch back to chat target', async ()
       assert.equal(calls.length, 2, 'reclaim must issue the switch');
       assert.equal(calls[1].provider, 'zai-coding-cn');
       assert.equal(calls[1].model, 'glm-5.3-flash');
-      const decision = (await readLines()).find((l) => l.tool === 'agent/pre-step/decision' && l.sid === sid && l.turn === 2);
+      const decision = await waitLine(readLines,(l) => l.tool === 'agent/pre-step/decision' && l.sid === sid && l.turn === 2);
       assert.ok(decision, 'decision line must exist');
       assert.notEqual(decision.keepReason, 'user-manual-selection-kept');
     } finally {
@@ -588,7 +630,7 @@ await t('reclaim unknown model=false keeps conservatively (no switch)', async ()
       await runStep(handlers, { text: '你现在的模型是？', sid, turn: 2 });
       await new Promise((r) => setTimeout(r, 50));
       assert.equal(calls.length, 1, 'reclaim off must not switch');
-      const decision = (await readLines()).find((l) => l.tool === 'agent/pre-step/decision' && l.sid === sid && l.turn === 2);
+      const decision = await waitLine(readLines,(l) => l.tool === 'agent/pre-step/decision' && l.sid === sid && l.turn === 2);
       assert.ok(decision, 'decision line must exist');
       assert.equal(decision.keepReason, 'user-manual-selection-kept');
       assert.notEqual(decision.switched, true, 'must not switch');
@@ -777,7 +819,7 @@ await t('v0.7.5 enabled=false logs only, never switches', async () => {
     await runStep(handlers, { text: '帮我装插件', sid: 'session-disabled', meta: {} });
     await new Promise((r) => setTimeout(r, 50));
     assert.equal(calls.length, 0, 'disabled plugin must not switch any model');
-    const decision = (await readLines()).find((l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-disabled');
+    const decision = await waitLine(readLines,(l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-disabled');
     assert.ok(decision, 'decision line must still be written (log-only mode)');
     assert.equal(decision.keepReason, 'enabled-off');
     assert.notEqual(decision.switched, true, 'must not switch');
@@ -797,7 +839,7 @@ await t('v0.7.5 priorityMode=auto overrides manual keep (routing wins)', async (
     await runStep(handlers, { text: '帮我装插件', sid: 'session-pmode-auto', meta: {} });
     await new Promise((r) => setTimeout(r, 50));
     assert.equal(calls.length, 1, 'auto priority must let routing override the manual keep');
-    const decision = (await readLines()).find((l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-pmode-auto');
+    const decision = await waitLine(readLines,(l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-pmode-auto');
     assert.ok(decision, 'decision line must exist');
     assert.notEqual(decision.keepReason, 'user-manual-selection-kept');
     assert.equal(decision.switched, true, 'routing must actually switch');
@@ -808,16 +850,22 @@ await t('v0.7.5 priorityMode=auto overrides manual keep (routing wins)', async (
 await t('v0.7.5 priorityMode=manual keeps manual selection', async () => {
   await withTmpLog(async (readLines) => {
     const { ctx, handlers, calls } = makeCtx();
+    const proj = { on: false };
+    // v0.8.0 两轮断言：T1 首轮默认 chat 落真切建台账（durable 关闭）；T2 打开手动投影再断言保持
     ctx.sessionProjections = {
-      stateOf: () => ({ lastUsed: null, pending: { provider: 'our-free-model', model: 'muse-spark-1.3-contributor-free', reasoningEffort: 'deep' } }),
+      stateOf: () => ({ lastUsed: null, pending: proj.on ? { provider: 'our-free-model', model: 'muse-spark-1.3-contributor-free', reasoningEffort: 'deep' } : null }),
     };
     ctx.sessions = { get: () => ({}) };
     apply(ctx, { reclaimUnknownModel: false, priorityMode: 'manual' });
-    await runStep(handlers, { text: '帮我装插件', sid: 'session-pmode-manual', meta: {} });
+    await runStep(handlers, { text: '帮我装插件', sid: 'session-pmode-manual', meta: {}, turn: 1 });
     await new Promise((r) => setTimeout(r, 50));
-    assert.equal(calls.length, 0, 'manual priority must block the switch');
-    const decision = (await readLines()).find((l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-pmode-manual');
-    assert.ok(decision, 'decision line must exist');
+    assert.equal(calls.length, 1, 'T1 first-turn chat switch primes ledger');
+    proj.on = true;
+    await runStep(handlers, { text: '帮我装插件', sid: 'session-pmode-manual', meta: {}, turn: 2 });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(calls.length, 1, 'T2 manual priority must block any further switch');
+    const decision = await waitLine(readLines,(l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-pmode-manual' && l.turn === 2);
+    assert.ok(decision, 'turn2 decision line must exist');
     assert.equal(decision.keepReason, 'user-manual-selection-kept');
   });
 });
@@ -867,7 +915,7 @@ await t('v0.7.5 chatMode=manual pins manualChatModel', async () => {
     assert.equal(calls.length, 1);
     assert.equal(calls[0].provider, 'my-api');
     assert.equal(calls[0].model, 'glm-x');
-    const decision = (await readLines()).find((l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-chatmanual');
+    const decision = await waitLine(readLines,(l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-chatmanual');
     assert.ok(decision, 'decision line must exist');
     assert.equal(decision.branch, 'chat-manual-locked');
   });
@@ -883,39 +931,45 @@ await t('v0.7.5 chatMode=auto ignores manualChatModel (priority chain head)', as
     assert.equal(calls.length, 1);
     assert.equal(calls[0].provider, 'zai-coding-cn');
     assert.equal(calls[0].model, 'glm-5.3-flash');
-    const decision = (await readLines()).find((l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-chatauto');
+    const decision = await waitLine(readLines,(l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-chatauto');
     assert.ok(decision, 'decision line must exist');
     assert.equal(decision.branch, 'chat-auto-chain');
   });
 });
 
 // 分支四 work：workMode=manual ⇒ 固定 manualWorkModel，branch=work-manual-locked（新字段路径，非 legacy 键）
+// v0.8.0 首轮弹窗：新会话首轮默认 chat 放行，干活关键词第二轮才升 work —— 两轮断言。
 await t('v0.7.5 workMode=manual pins manualWorkModel', async () => {
   await withTmpLog(async (readLines) => {
     const { ctx, handlers, calls } = makeCtx();
-    apply(ctx, { workMode: 'manual', manualWorkModel: 'our-free-model/muse-spark-1.3-contributor-free' });
+    apply(ctx, { workMode: 'manual', manualWorkModel: 'our-free-model/muse-spark-1.3-contributor-free', firstTurnPrompt: false });
     await runStep(handlers, { text: '帮我装插件', sid: 'session-workmanual', meta: {} });
     await new Promise((r) => setTimeout(r, 50));
-    assert.equal(calls.length, 1);
-    assert.equal(calls[0].model, 'muse-spark-1.3-contributor-free');
-    const decision = (await readLines()).find((l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-workmanual');
-    assert.ok(decision, 'decision line must exist');
+    await runStep(handlers, { text: '帮我装插件', sid: 'session-workmanual', meta: {}, turn: 2 });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.ok(calls.length >= 1);
+    assert.equal(calls[calls.length - 1].model, 'muse-spark-1.3-contributor-free');
+    const decision = await waitLine(readLines,(l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-workmanual' && l.turn === 2);
+    assert.ok(decision, 'turn2 decision line must exist');
     assert.equal(decision.branch, 'work-manual-locked');
   });
 });
 
 // 分支四 work：workMode=auto ⇒ 忽略 manualWorkModel，走静态链/回退（动态榜关=确定性），branch=work-auto-chain
+// v0.8.0 首轮弹窗：两轮断言（首轮 chat 放行，第二轮升 work）。
 await t('v0.7.5 workMode=auto ignores manualWorkModel (chain/fallback)', async () => {
   await withTmpLog(async (readLines) => {
     const { ctx, handlers, calls } = makeCtx();
-    apply(ctx, { workMode: 'auto', manualWorkModel: 'our-free-model/muse-spark-1.3-contributor-free', enableDynamicRanking: false });
+    apply(ctx, { workMode: 'auto', manualWorkModel: 'our-free-model/muse-spark-1.3-contributor-free', enableDynamicRanking: false, firstTurnPrompt: false });
     await runStep(handlers, { text: '帮我装插件', sid: 'session-workauto', meta: {} });
     await new Promise((r) => setTimeout(r, 50));
-    assert.equal(calls.length, 1);
-    assert.notEqual(calls[0].model, 'muse-spark-1.3-contributor-free', 'auto mode must not honour the manual value');
-    assert.equal(calls[0].model, 'mimo-v2.6-flash-free', 'chain/fallback value expected');
-    const decision = (await readLines()).find((l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-workauto');
-    assert.ok(decision, 'decision line must exist');
+    await runStep(handlers, { text: '帮我装插件', sid: 'session-workauto', meta: {}, turn: 2 });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.ok(calls.length >= 1);
+    assert.notEqual(calls[calls.length - 1].model, 'muse-spark-1.3-contributor-free', 'auto mode must not honour the manual value');
+    assert.equal(calls[calls.length - 1].model, 'mimo-v2.6-flash-free', 'chain/fallback value expected');
+    const decision = await waitLine(readLines,(l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-workauto' && l.turn === 2);
+    assert.ok(decision, 'turn2 decision line must exist');
     assert.equal(decision.branch, 'work-auto-chain');
   });
 });
