@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.5] - 2026-10-06
+
+### Added
+- Client settings page on `plugins.bundle.config` (key = npm package name): 15 volatile fields via `SettingsFormModel` + `SettingsForm` shell (commit fedb172)
+- 15 volatile Config keys: enabled / priorityMode / workMode / manualWorkModel / workModelPriority / workModelFallback / enableDynamicRanking / rankingRefreshSeconds / chatMode / manualChatModel / chatModelPriority / enableGroupHint / hintCooldownMs / switchCooldownMs / reclaimUnknownModel (+ 3 hidden selftest keys)
+- Behavior gates: enabled master switch / priorityMode manual-vs-auto / workMode-chatMode manual pins / enableGroupHint cooldown gate (commit d69f30d)
+- Production patch migrated from 13 legacy keys to 15 new keys (legacy chatProvider/chatModel/chatEffort/workProvider/workModel/workEffort/workEffortOwned/privateChatWorkStrategy/manualWorkModelLocked removed)
+
 ## [0.7.2] - 2026-10-07
 
 ### Added

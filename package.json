@@ -1,6 +1,6 @@
 {
   "name": "dsh-auto-model-router",
-  "version": "0.7.2",
+  "version": "0.7.5",
   "description": "一个按会话来源自动切换模型与推理档位的 DSH 插件：IM 聊天走省 token 模型，Agent 工作走 our-free-model 最强模型最高档。",
   "license": "MIT",
   "type": "module",
