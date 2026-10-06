@@ -59,6 +59,8 @@ window.__ModuleLoader__.load({
       save: 'Save',
       saving: 'Saving…',
       saveFailed: 'The deployment did not accept these values; they were left for you to correct.',
+      saveFailedFields: 'Failed fields:',
+      saveTimeout: 'Save timed out; please try again.',
       invalidNumber: 'Enter a number, or leave blank to use the default.',
       invalidValue: 'Invalid value; please correct it before saving.',
     };
@@ -106,6 +108,8 @@ window.__ModuleLoader__.load({
       save: '保存',
       saving: '保存中…',
       saveFailed: '本部署没有接受这些值，已保留供你修改。',
+      saveFailedFields: '失败字段：',
+      saveTimeout: '保存超时，请重试。',
       invalidNumber: '请填数字；留空表示使用默认值。',
       invalidValue: '值无效，保存前请先修正。',
     };
@@ -238,7 +242,7 @@ window.__ModuleLoader__.load({
             value: st.text,
             rows: 3,
             disabled,
-            style: { width: '100%', boxSizing: 'border-box' },
+            style: { width: '100%', boxSizing: 'border-box', resize: 'vertical' },
             onChange: (e) => { props.edit(field, e.target.value); },
           }),
           st.overridden ? jsx('button', {
@@ -277,37 +281,61 @@ window.__ModuleLoader__.load({
       const jsx = react_jsx_runtime.jsx;
       const jsxs = react_jsx_runtime.jsxs;
       const disabled = !state.writable;
-      return jsx(_primitives.SettingsForm, {
-        labels: formLabels(t),
-        state,
-        onSave: props.save,
-        onDiscard: props.discard,
-        children: jsxs('div', {
-          children: [
-            boolRow(jsx, t, props, state, 'enabled', disabled),
-            unionRow(jsx, t, props, state, 'priorityMode', disabled),
-            unionRow(jsx, t, props, state, 'workMode', disabled),
-            textRow(jsx, t, props, state, 'manualWorkModel', disabled, false),
-            arrayRow(jsx, t, props, state, 'workModelPriority', disabled),
-            textRow(jsx, t, props, state, 'workModelFallback', disabled, false),
-            boolRow(jsx, t, props, state, 'enableDynamicRanking', disabled),
-            textRow(jsx, t, props, state, 'rankingRefreshSeconds', disabled, true),
-            unionRow(jsx, t, props, state, 'chatMode', disabled),
-            textRow(jsx, t, props, state, 'manualChatModel', disabled, false),
-            arrayRow(jsx, t, props, state, 'chatModelPriority', disabled),
-            boolRow(jsx, t, props, state, 'enableGroupHint', disabled),
-            textRow(jsx, t, props, state, 'hintCooldownMs', disabled, true),
-            textRow(jsx, t, props, state, 'switchCooldownMs', disabled, true),
-            boolRow(jsx, t, props, state, 'reclaimUnknownModel', disabled),
-          ],
-        }),
+      const failedExtra = state.failed && (state.failedFields?.length || state.saveError)
+        ? jsx('p', {
+          key: 'save-failed-fields',
+          role: 'status',
+          children: (state.saveError === 'timeout' ? t('saveTimeout') + ' ' : '')
+            + t('saveFailedFields') + ' ' + (state.failedFields || []).join(', '),
+        })
+        : null;
+      return jsxs('div', {
+        key: 'router-config-wrap',
+        children: [
+          failedExtra,
+          jsx(_primitives.SettingsForm, {
+            key: 'router-config-form',
+            labels: formLabels(t),
+            state,
+            onSave: props.save,
+            onDiscard: props.discard,
+            children: jsxs('div', {
+              children: [
+                boolRow(jsx, t, props, state, 'enabled', disabled),
+                unionRow(jsx, t, props, state, 'priorityMode', disabled),
+                unionRow(jsx, t, props, state, 'workMode', disabled),
+                textRow(jsx, t, props, state, 'manualWorkModel', disabled, false),
+                arrayRow(jsx, t, props, state, 'workModelPriority', disabled),
+                textRow(jsx, t, props, state, 'workModelFallback', disabled, false),
+                boolRow(jsx, t, props, state, 'enableDynamicRanking', disabled),
+                textRow(jsx, t, props, state, 'rankingRefreshSeconds', disabled, true),
+                unionRow(jsx, t, props, state, 'chatMode', disabled),
+                textRow(jsx, t, props, state, 'manualChatModel', disabled, false),
+                arrayRow(jsx, t, props, state, 'chatModelPriority', disabled),
+                boolRow(jsx, t, props, state, 'enableGroupHint', disabled),
+                textRow(jsx, t, props, state, 'hintCooldownMs', disabled, true),
+                textRow(jsx, t, props, state, 'switchCooldownMs', disabled, true),
+                boolRow(jsx, t, props, state, 'reclaimUnknownModel', disabled),
+              ],
+            }),
+          }),
+        ],
       });
     }
 
     const ENTRY_NS = 'auto-model-router';
+    // 保存串行队列 + 看门狗（社区 PR #114 / 22fee9d 口径）：
+    // 绝不重叠两次 scope.mutate()；失败/超时必复位 saving。
+    const SAVE_TIMEOUT_MS = 5000;
     var RouterCardController = class {
       form;
       store;
+      saving = false;
+      saveQueued = false;
+      failed = false;
+      failedFields = [];
+      saveError = '';
+      saveTimer = null;
       /** @param scope - the shared configuration form of the auto-model-router entry. */
       constructor(scope) {
         this.form = new _primitives.SettingsFormModel(scope, [
@@ -332,6 +360,10 @@ window.__ModuleLoader__.load({
       projection() {
         return {
           ...this.form.shell(),
+          saving: this.saving || this.form.shell().saving,
+          failed: this.failed || this.form.shell().failed,
+          failedFields: this.failedFields,
+          saveError: this.saveError,
           enabled: this.form.field('enabled'),
           priorityMode: this.form.field('priorityMode'),
           workMode: this.form.field('workMode'),
@@ -349,18 +381,117 @@ window.__ModuleLoader__.load({
           reclaimUnknownModel: this.form.field('reclaimUnknownModel'),
         };
       }
+      planFields() {
+        try {
+          return this.form.plan().map((item) => item.field).filter(Boolean);
+        } catch (_e) {
+          return [];
+        }
+      }
+      armSaveTimer() {
+        this.clearSaveTimer();
+        this.saveTimer = setTimeout(() => {
+          this.saveTimer = null;
+          this.saving = false;
+          this.failed = true;
+          this.saveError = 'timeout';
+          try { this.form.saving = false; this.form.failed = true; } catch (_e) {}
+          this.publish();
+          if (this.saveQueued) {
+            this.saveQueued = false;
+            this.saveNow();
+          }
+        }, SAVE_TIMEOUT_MS);
+      }
+      clearSaveTimer() {
+        if (this.saveTimer) {
+          clearTimeout(this.saveTimer);
+          this.saveTimer = null;
+        }
+      }
+      publish() {
+        try { this.form.publish(); } catch (_e) {}
+      }
+      async saveNow() {
+        const fields = this.planFields();
+        this.saving = true;
+        this.failed = false;
+        this.failedFields = [];
+        this.saveError = '';
+        this.armSaveTimer();
+        this.publish();
+        let ok = false;
+        try {
+          const r = this.form.save();
+          if (r && typeof r.then === 'function') await r;
+          // SettingsFormModel.save() 无返回值：以落盘后状态判定
+          // 成功 = 内层 failed 为假且待写计划已清空；守卫拦截（非法值/空计划）计划仍非空→判失败
+          let innerFailed = false;
+          let remain = 0;
+          try { innerFailed = !!this.form.shell().failed; } catch (_e) {}
+          try { remain = this.form.plan().length; } catch (_e) {}
+          ok = !innerFailed && remain === 0;
+          if (!ok && !innerFailed && remain === 0) ok = true; // 空计划守卫：无事可存也算成功
+        } catch (_e) {
+          ok = false;
+        }
+        this.clearSaveTimer();
+        this.saving = false;
+        if (ok) {
+          this.failed = false;
+          this.failedFields = [];
+          this.saveError = '';
+        } else {
+          this.failed = true;
+          this.failedFields = fields.length ? fields : this.planFields();
+          if (!this.saveError) this.saveError = 'rejected';
+          try { this.form.failed = true; } catch (_e) {}
+        }
+        try { this.form.saving = false; } catch (_e) {}
+        this.publish();
+        if (this.saveQueued) {
+          this.saveQueued = false;
+          this.saveNow();
+        }
+      }
+      /**
+       * 串行 save：保存中再按只排队，不重叠 mutate。
+       */
+      save() {
+        if (this.saving) {
+          this.saveQueued = true;
+          return;
+        }
+        this.saveNow();
+      }
+      discard() {
+        this.saveQueued = false;
+        this.clearSaveTimer();
+        this.saving = false;
+        this.failed = false;
+        this.failedFields = [];
+        this.saveError = '';
+        try { this.form.discard(); } catch (_e) {}
+        this.publish();
+      }
       /**
        * Build the face the bundle config slot registration injects.
        * @returns the page's snapshot and its form actions.
        */
       inject() {
+        const base = this.form.actions();
         return {
           hooks: { routerCard: this.store },
-          ...this.form.actions(),
+          edit: base.edit,
+          resetField: base.resetField,
+          save: () => this.save(),
+          discard: () => this.discard(),
         };
       }
       /** Release the form subscription. */
       dispose() {
+        this.saveQueued = false;
+        this.clearSaveTimer();
         this.form.dispose();
       }
     };
