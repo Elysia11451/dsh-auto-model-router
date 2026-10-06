@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.1 — 2026-10-06
+
+系统重试消息过滤（isHumanInput，commit 99d2be0）：
+
+- **根因**：`dsh-auto-continue` 的失败重试通知把 `source.kind` 伪造成 `"user"`（为了在聊天界面渲染气泡），旧 `extractUserText` 只看 `role==='user'`，把重试通知当真人指令做路由决策，导致失败重试轮次误触发模型切换。
+- **修复**：新增 `isHumanInput(m)`——`source.kind==='user'` 且无 `producer` 署名且 `form!=='notice'` 才算真人；`extractUserText` 返回 `{text, skipReason, rejectedText}`，末条 user 形消息是非人注入时返回 `skipReason='system-retry-skipped'`，`agent/pre-step` 整轮跳过路由（`return next()`，不切换），并落 `agent/pre-step/skip` 日志（`reason=system-retry-skipped`，含被拒原文前 300 字供取证，每轮只记一次）。无文本非人消息仍走旧形状探针路径。
+- **测试**：`test/crash.test.mjs` +3（auto-continue 重试通知形状 → 跳过不切换 / 非 user kind → 旧探针路径 / 真人消息 → 正常路由切 chat），npm test 101 全绿（router 36 / crash 35 / leaderboard 30）。
+- **生产状态不变**：`disabled: true`，不部署。
+
 ## 0.7.0 — 2026-10-06
 
 FreeTierError 应对 + 排行榜补完（m00002 规格）：
