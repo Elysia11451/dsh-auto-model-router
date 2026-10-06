@@ -58,7 +58,7 @@ export const Config = Schema.object({
     .description({ zh: '手动：固定用下方填的自有 API 模型；自动：按下方降级链从便宜到贵挑', en: 'Manual: pin your owned-API model below; Auto: walk the chain below from cheapest upward' }),
   manualChatModel: Schema.string().default('').volatile()
     .description({ zh: '仅手动模式生效。格式 provider/model；裸模型名配你自己的 provider；留空回退兜底并打警告', en: 'Only used in manual mode. provider/model; bare name pairs with your provider; empty falls back with a warning' }),
-  chatModelPriority: Schema.array(Schema.string()).default(['zai-coding-cn/glm-5.3-flash', 'deepseek/deepseek-chat']).volatile()
+  chatModelPriority: Schema.array(Schema.string()).default(['zai-coding-cn/glm-5.3-flash', 'deepseek/deepseek-flash']).volatile()
     .description({ zh: '仅自动模式生效。从便宜到贵排序，依次挑你配过 key 的可用者', en: 'Only used in auto mode. Cheapest-first; picks the first one you have a key for' }),
   // —— 分组 D · 群聊（默认折叠，高级）——
   enableGroupHint: Schema.boolean().default(false).volatile()
@@ -150,7 +150,7 @@ export function apply(ctx, config = {}) {
     // C chat 档：legacy chatModel 在场（含空串）走 legacy；否则新字段合成
     c.chatMode = pick('chatMode', 'auto');
     c.manualChatModel = pick('manualChatModel', '');
-    c.chatModelPriority = pick('chatModelPriority', ['zai-coding-cn/glm-5.3-flash', 'deepseek/deepseek-chat']);
+    c.chatModelPriority = pick('chatModelPriority', ['zai-coding-cn/glm-5.3-flash', 'deepseek/deepseek-flash']);
     const legacyChat = getRaw('chatModel');
     if (legacyChat !== undefined) {
       c.chatProvider = pick('chatProvider', DEFAULTS.chatProvider);
@@ -1472,6 +1472,7 @@ export function apply(ctx, config = {}) {
             target: origTargetStr,
             keepReason: holder?.autoModelRouter?.keepReason ?? null,
             switched: holder?.autoModelRouter?.switched ?? null,
+            switchError: holder?.autoModelRouter?.switchError ?? null,
             actualSel: null,
             turn: payload?.turn ?? null,
             step: payload?.step ?? null,

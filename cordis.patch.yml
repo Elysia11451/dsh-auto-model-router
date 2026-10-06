@@ -17,7 +17,7 @@
         manualChatModel: ""
         chatModelPriority:
           - zai-coding-cn/glm-5.3-flash
-          - deepseek/deepseek-chat
+          - deepseek/deepseek-flash
         enableGroupHint: false
         hintCooldownMs: 300000
         switchCooldownMs: 5000
