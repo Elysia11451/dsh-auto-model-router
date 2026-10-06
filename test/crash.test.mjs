@@ -767,4 +767,157 @@ await t('JSONL mode/chatTurns + mode-changed event on upgrade (stage-3)', async 
   });
 });
 
+// ── v0.7.5 Step4：行为分支门控 ──────────────────────────────────────────────
+
+// 分支一：enabled=false 总开关 ⇒ 只记日志不切换模型（decision 行 carry keepReason=enabled-off）
+await t('v0.7.5 enabled=false logs only, never switches', async () => {
+  await withTmpLog(async (readLines) => {
+    const { ctx, handlers, calls } = makeCtx();
+    apply(ctx, { enabled: false });
+    await runStep(handlers, { text: '帮我装插件', sid: 'session-disabled', meta: {} });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(calls.length, 0, 'disabled plugin must not switch any model');
+    const decision = (await readLines()).find((l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-disabled');
+    assert.ok(decision, 'decision line must still be written (log-only mode)');
+    assert.equal(decision.keepReason, 'enabled-off');
+    assert.notEqual(decision.switched, true, 'must not switch');
+    assert.ok(Object.hasOwn(decision, 'branch'), 'decision must carry branch field');
+  });
+});
+
+// 分支二：priorityMode=auto ⇒ 路由规则压过"user-manual-selection-kept"（保守理由仍不放行）
+await t('v0.7.5 priorityMode=auto overrides manual keep (routing wins)', async () => {
+  await withTmpLog(async (readLines) => {
+    const { ctx, handlers, calls } = makeCtx();
+    ctx.sessionProjections = {
+      stateOf: () => ({ lastUsed: null, pending: { provider: 'our-free-model', model: 'muse-spark-1.3-contributor-free', reasoningEffort: 'deep' } }),
+    };
+    ctx.sessions = { get: () => ({}) };
+    apply(ctx, { reclaimUnknownModel: false, priorityMode: 'auto' });
+    await runStep(handlers, { text: '帮我装插件', sid: 'session-pmode-auto', meta: {} });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(calls.length, 1, 'auto priority must let routing override the manual keep');
+    const decision = (await readLines()).find((l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-pmode-auto');
+    assert.ok(decision, 'decision line must exist');
+    assert.notEqual(decision.keepReason, 'user-manual-selection-kept');
+    assert.equal(decision.switched, true, 'routing must actually switch');
+  });
+});
+
+// 分支二对照：priorityMode=manual（默认语义显式声明）⇒ 手动保持原样生效
+await t('v0.7.5 priorityMode=manual keeps manual selection', async () => {
+  await withTmpLog(async (readLines) => {
+    const { ctx, handlers, calls } = makeCtx();
+    ctx.sessionProjections = {
+      stateOf: () => ({ lastUsed: null, pending: { provider: 'our-free-model', model: 'muse-spark-1.3-contributor-free', reasoningEffort: 'deep' } }),
+    };
+    ctx.sessions = { get: () => ({}) };
+    apply(ctx, { reclaimUnknownModel: false, priorityMode: 'manual' });
+    await runStep(handlers, { text: '帮我装插件', sid: 'session-pmode-manual', meta: {} });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(calls.length, 0, 'manual priority must block the switch');
+    const decision = (await readLines()).find((l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-pmode-manual');
+    assert.ok(decision, 'decision line must exist');
+    assert.equal(decision.keepReason, 'user-manual-selection-kept');
+  });
+});
+
+// 分支三：enableGroupHint=false（默认）不弹；true 弹一次，第二轮进冷却不再弹
+await t('v0.7.5 enableGroupHint gate: off = silent, on = hint once with cooldown', async () => {
+  const groupProj = () => ({
+    stateOf: () => ({ lastUsed: null, pending: { provider: 'our-free-model', model: 'mimo-v2.6-flash-free', reasoningEffort: 'light' } }),
+  });
+  // 关（默认语义）：全程 0 条 group hint 日志
+  await withTmpLog(async () => {
+    const { ctx, handlers } = makeCtx();
+    const logs = [];
+    ctx.logger = () => ({ info: (m) => logs.push(String(m)), warn: () => {}, error: () => {} });
+    ctx.sessionProjections = groupProj();
+    ctx.sessions = { get: () => ({}) };
+    apply(ctx, { enableGroupHint: false, enableDynamicRanking: false });
+    await runStep(handlers, { text: '哈哈哈', sid: 'session-hint-off', meta: { channel: 'qq', chatType: 'group' }, turn: 1 });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(logs.filter((m) => m.includes('group hint for session')).length, 0, 'disabled hint must stay silent');
+  });
+  // 开：第一轮弹 1 条，第二轮冷却内不再弹
+  await withTmpLog(async () => {
+    const { ctx, handlers } = makeCtx();
+    const logs = [];
+    ctx.logger = () => ({ info: (m) => logs.push(String(m)), warn: () => {}, error: () => {} });
+    ctx.sessionProjections = groupProj();
+    ctx.sessions = { get: () => ({}) };
+    apply(ctx, { enableGroupHint: true, enableDynamicRanking: false });
+    const hintCount = () => logs.filter((m) => m.includes('group hint for session')).length;
+    await runStep(handlers, { text: '哈哈哈', sid: 'session-hint-on', meta: { channel: 'qq', chatType: 'group' }, turn: 1 });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(hintCount(), 1, 'enabled hint must fire exactly once');
+    await runStep(handlers, { text: '在吗', sid: 'session-hint-on', meta: { channel: 'qq', chatType: 'group' }, turn: 2 });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(hintCount(), 1, 'second round must be inside cooldown');
+  });
+});
+
+// 分支四 chat：chatMode=manual ⇒ 固定 manualChatModel（prov/mod 拆开），branch=chat-manual-locked
+await t('v0.7.5 chatMode=manual pins manualChatModel', async () => {
+  await withTmpLog(async (readLines) => {
+    const { ctx, handlers, calls } = makeCtx();
+    apply(ctx, { chatMode: 'manual', manualChatModel: 'my-api/glm-x' });
+    await runStep(handlers, { text: '你好', sid: 'session-chatmanual', meta: { channel: 'weixin' } });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].provider, 'my-api');
+    assert.equal(calls[0].model, 'glm-x');
+    const decision = (await readLines()).find((l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-chatmanual');
+    assert.ok(decision, 'decision line must exist');
+    assert.equal(decision.branch, 'chat-manual-locked');
+  });
+});
+
+// 分支四 chat：chatMode=auto ⇒ 忽略 manualChatModel，走 chatModelPriority 链头，branch=chat-auto-chain
+await t('v0.7.5 chatMode=auto ignores manualChatModel (priority chain head)', async () => {
+  await withTmpLog(async (readLines) => {
+    const { ctx, handlers, calls } = makeCtx();
+    apply(ctx, { chatMode: 'auto', manualChatModel: 'my-api/glm-x' });
+    await runStep(handlers, { text: '你好', sid: 'session-chatauto', meta: { channel: 'weixin' } });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].provider, 'zai-coding-cn');
+    assert.equal(calls[0].model, 'glm-5.3-flash');
+    const decision = (await readLines()).find((l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-chatauto');
+    assert.ok(decision, 'decision line must exist');
+    assert.equal(decision.branch, 'chat-auto-chain');
+  });
+});
+
+// 分支四 work：workMode=manual ⇒ 固定 manualWorkModel，branch=work-manual-locked（新字段路径，非 legacy 键）
+await t('v0.7.5 workMode=manual pins manualWorkModel', async () => {
+  await withTmpLog(async (readLines) => {
+    const { ctx, handlers, calls } = makeCtx();
+    apply(ctx, { workMode: 'manual', manualWorkModel: 'our-free-model/muse-spark-1.3-contributor-free' });
+    await runStep(handlers, { text: '帮我装插件', sid: 'session-workmanual', meta: {} });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].model, 'muse-spark-1.3-contributor-free');
+    const decision = (await readLines()).find((l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-workmanual');
+    assert.ok(decision, 'decision line must exist');
+    assert.equal(decision.branch, 'work-manual-locked');
+  });
+});
+
+// 分支四 work：workMode=auto ⇒ 忽略 manualWorkModel，走静态链/回退（动态榜关=确定性），branch=work-auto-chain
+await t('v0.7.5 workMode=auto ignores manualWorkModel (chain/fallback)', async () => {
+  await withTmpLog(async (readLines) => {
+    const { ctx, handlers, calls } = makeCtx();
+    apply(ctx, { workMode: 'auto', manualWorkModel: 'our-free-model/muse-spark-1.3-contributor-free', enableDynamicRanking: false });
+    await runStep(handlers, { text: '帮我装插件', sid: 'session-workauto', meta: {} });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(calls.length, 1);
+    assert.notEqual(calls[0].model, 'muse-spark-1.3-contributor-free', 'auto mode must not honour the manual value');
+    assert.equal(calls[0].model, 'mimo-v2.6-flash-free', 'chain/fallback value expected');
+    const decision = (await readLines()).find((l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-workauto');
+    assert.ok(decision, 'decision line must exist');
+    assert.equal(decision.branch, 'work-auto-chain');
+  });
+});
+
 console.log('crash tests done');

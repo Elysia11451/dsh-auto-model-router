@@ -217,12 +217,14 @@ export function apply(ctx, config = {}) {
       cfg = buildCfg();
       dynamicOn = cfg.enableDynamicRanking !== false;
       syncManualLock();
-      safeLog(ctx, 'info', `config reloaded (${reason || 'volatile-update'}): workMode=${cfg.workMode} chatMode=${cfg.chatMode} dynamic=${dynamicOn} lock=${manualLock.on}.`);
+      safeLog(ctx, 'info', `config reloaded (${reason || 'volatile-update'}): enabled=${cfg.enabled} priority=${cfg.priorityMode} hint=${cfg.enableGroupHint} workMode=${cfg.workMode} chatMode=${cfg.chatMode} dynamic=${dynamicOn} lock=${manualLock.on}.`);
     } catch { /* reload 失败保持旧配置 */ }
   }
   try {
     if (typeof ctx?.on === 'function') ctx.on('loader/volatile-update', () => reloadCfg('volatile-update'));
   } catch { /* 旧宿主无该事件 */ }
+  // v0.7.5 Step4：四门控启动快照（配置→cfg 接线的可观测证据；隔离验证逐跑核对用）。
+  safeLog(ctx, 'info', `gates: enabled=${cfg.enabled} priority=${cfg.priorityMode} hint=${cfg.enableGroupHint} workMode=${cfg.workMode} chatMode=${cfg.chatMode} (reason=gates-initialized).`);
 
   // ── v0.5.3：已知干活对（reclaimUnknownModel 判定用，全部来自配置，零硬编码）──
   // 只收"配置里点名的"干活 pair（workModel/workModelFallback/生效的手动锁）。
@@ -644,6 +646,37 @@ export function apply(ctx, config = {}) {
     }
   }
 
+  // ── v0.7.5 Step4 分支二：priorityMode 门控 ──
+  // 'manual'（默认）⇒ manualKeepReason 结果原样生效（尊重用户手动选择）；
+  // 'auto' ⇒ 路由规则优先，仅放行 'user-manual-selection-kept' 这一条保守理由，
+  // 其余（selection-state-unreadable / projection-unreadable-fallback）读不出状态时
+  // 永不放行——绝不赌手动选择。
+  function applyPriorityMode(keep, sid, where) {
+    try {
+      if (keep !== 'user-manual-selection-kept') return keep;
+      if (String(cfg?.priorityMode ?? 'manual') !== 'auto') return keep;
+      safeLog(ctx, 'info', `${where} ${sid}: manual keep overridden (reason=priority-auto-override; priorityMode=auto, routing rules win).`);
+      return null;
+    } catch { return keep; } // 配置读取失败保持保守（照旧尊重手动）
+  }
+
+  // ── v0.7.5 Step4 分支四：档位来源标注（纯诊断，不参与决策）──
+  // work: manual = 手动锁生效（manualWorkModel 固定）；auto-rank = auto 档且动态榜开启
+  //   （榜/清单不可用时运行时仍会回落静态链）；auto-chain = auto 档且动态榜关闭（纯静态链）。
+  // chat: manual = chatMode=manual 且 manualChatModel 非空；auto-chain = chatModelPriority 链头。
+  // 标注按配置档位判定，不猜测运行时实际取到了榜还是链。
+  function routeBranch(route) {
+    try {
+      const mode = String(route?.mode ?? '');
+      if (mode === 'work') return manualLock.on ? 'work-manual-locked' : (dynamicOn ? 'work-auto-rank' : 'work-auto-chain');
+      if (mode === 'chat') {
+        const manualChat = String(cfg?.chatMode ?? '') === 'manual' && String(cfg?.manualChatModel ?? '').trim() !== '';
+        return manualChat ? 'chat-manual-locked' : 'chat-auto-chain';
+      }
+      return '';
+    } catch { return ''; }
+  }
+
   // ── 死代码清理（v0.4）：isUserWorkChoice 按 provider 全家判定，与精确同类口径冲突，
   // 且无任何调用方（grep 全仓零引用）——已删除，手动尊重统一走 shouldSwitch/isSameKind。
 
@@ -678,11 +711,17 @@ export function apply(ctx, config = {}) {
       safeLog(ctx, 'warn', `${tag} | early-return reason=no-session`);
       return { ok: false, reason: 'no-session', target };
     }
+    // v0.7.5 Step4 分支一：enabled=false 总开关关闭 ⇒ 插件只记日志不切换模型
+    // （pre-step 已有显式分支落 keepReason=enabled-off；此处是真切单咽喉的兜底门）。
+    if (cfg?.enabled === false) {
+      safeLog(ctx, 'info', `${tag} | early-return reason=enabled-off (plugin disabled; log-only mode, no model switch).`);
+      return { ok: false, reason: 'enabled-off', target };
+    }
     // 功能一短路（规格落点）：durable 手动选择/请求头在位 → 绝不覆盖（user-manual-selection-kept）。
     // v0.5.2：透传 route.mode，冷启动空台账时跨类可放行一次（reason 不再是 kept 而是真切）。
     // 放在 controller 解析之前：保留与否是读判定，不依赖真切服务是否就绪。
     try {
-      const keep = manualKeepReason(sid, null, target?.__routeMode ?? routeMode);
+      const keep = applyPriorityMode(manualKeepReason(sid, null, target?.__routeMode ?? routeMode), sid, 'realSwitch');
       if (keep) {
         safeLog(ctx, 'info', `${tag} | early-return reason=${keep} (manual selection absolute; durable selection/header present).`);
         return { ok: false, reason: keep, target };
@@ -860,6 +899,8 @@ export function apply(ctx, config = {}) {
   //  - 解除：切回非 work 模型 -> 清状态；群聊明确工作指令 -> 清状态（重新起算）
   function maybeGroupHint(ctxRef, exec, route) {
     try {
+      // v0.7.5 Step4 分支三：enableGroupHint=false（默认）⇒ 不弹群聊提示（早退，hintState 不动）。
+      if (cfg?.enableGroupHint !== true) return;
       const meta = exec?.agent?.source || exec?.meta || {};
       const sessionKey = sidOf(exec) || 'unknown';
       // 官方无 exec.agent.model 字段：读 model/selection 投影，再回退本插件切换缓存。
@@ -1005,6 +1046,7 @@ export function apply(ctx, config = {}) {
               extractText: String(text ?? '').slice(0, 500),
               task: route?.task ?? '',
               route: route?.mode ?? '',
+              branch: routeBranch(route), // v0.7.5 Step4 分支四：work/chat 档位来源（诊断）
               target: __target ? `${__target.provider}/${__target.model}/${__target.effort ?? '-'}` : null,
               keepReason: exec?.autoModelRouter?.keepReason ?? null,
               actualSel: null,
@@ -1264,6 +1306,7 @@ export function apply(ctx, config = {}) {
           extractText: String(text).slice(0, 500),
           task: route?.task ?? '',
           route: route?.mode ?? '',
+          branch: routeBranch(route), // v0.7.5 Step4 分支四：work/chat 档位来源（诊断）
           target: target ? `${target.provider}/${target.model}/${target.effort ?? '-'}` : null,
           keepReason: holder?.autoModelRouter?.keepReason ?? null,
           actualSel: null,
@@ -1282,9 +1325,15 @@ export function apply(ctx, config = {}) {
       try {
         const target = holder?.autoModelRouter?.target;
         const origTargetStr = target ? `${target.provider}/${target.model}/${target.effort ?? '-'}` : null;
-        if (target && sid && sid !== 'unknown' && freeModelOk !== false) {
+        // v0.7.5 Step4 分支一：enabled=false ⇒ 插件只记日志不切换模型。
+        // decision 行照写（keepReason=enabled-off），target 置 null = 本轮不真切。
+        if (target && sid && sid !== 'unknown' && cfg?.enabled === false) {
+          holder.autoModelRouter.target = null;
+          holder.autoModelRouter.keepReason = 'enabled-off';
+          safeLog(ctx, 'info', `pre-step skip switch for ${sid} (reason=enabled-off; target=${origTargetStr ?? '-'}; log-only mode).`);
+        } else if (target && sid && sid !== 'unknown' && freeModelOk !== false) {
           let keep = null;
-          try { keep = manualKeepReason(sid, null, route?.mode ?? ''); } catch { keep = null; }
+          try { keep = applyPriorityMode(manualKeepReason(sid, null, route?.mode ?? ''), sid, 'pre-step'); } catch { keep = null; }
           if (keep) {
             holder.autoModelRouter.target = null;
             holder.autoModelRouter.keepReason = keep;
@@ -1322,6 +1371,7 @@ export function apply(ctx, config = {}) {
             extractText: String(text).slice(0, 300),
             task: route?.task ?? '',
             route: route?.mode ?? '',
+            branch: routeBranch(route), // v0.7.5 Step4 分支四：work/chat 档位来源（诊断）
             target: origTargetStr,
             keepReason: holder?.autoModelRouter?.keepReason ?? null,
             switched: holder?.autoModelRouter?.switched ?? null,
@@ -1464,7 +1514,8 @@ export function apply(ctx, config = {}) {
         let target = exec?.autoModelRouter?.target;
         try {
           if (target) {
-            const keep = manualKeepReason(sid, null, route?.mode ?? '');
+            // v0.7.5 Step4 分支二：与生产 pre-step 同口径套 priorityMode 门控（默认 manual 时零变化）。
+            const keep = applyPriorityMode(manualKeepReason(sid, null, route?.mode ?? ''), sid, 'runRoute');
             if (keep) {
               exec.autoModelRouter.target = null;
               exec.autoModelRouter.kept = await readSelectionProjectionFresh(sid);
@@ -1827,10 +1878,13 @@ export function apply(ctx, config = {}) {
           const route4 = decideRoute({ source: 'im', text: '哈哈哈', meta: meta4, strategy: cfg.privateChatWorkStrategy });
           const hintKey = `group hint for session ${sid4}`;
           const cnt = () => selftestLines.filter((l) => l.includes(hintKey)).length;
+          // v0.7.5 Step4 分支三：断言随 enableGroupHint 门控走（不再块内强行打开）——
+          // 开 = 发一次 + 冷却内不再发；关（生产默认）= 全程静默。iso2 patch 配 true 验真机 ON 路径。
+          const hintGateOn = cfg.enableGroupHint === true;
           const h0 = cnt();
           maybeGroupHint(ctx, exec4, route4);
           const h1 = cnt();
-          maybeGroupHint(ctx, exec4, route4); // 冷却内第二次 → 不再提示
+          maybeGroupHint(ctx, exec4, route4); // 开：冷却内第二次不再提示；关：第二次同样静默
           const h2 = cnt();
           annotateRoute(exec4, route4, PINNED_WORK_MODEL);
           const tgt4 = exec4?.autoModelRouter?.target ?? null;
@@ -1839,10 +1893,10 @@ export function apply(ctx, config = {}) {
           const after4 = await readSelectionProjectionFresh(sid4);
           out.checks.s4_groupchat_work_to_chat = { round: ROUND, chatTarget: chatPair4,
             presetOk: pre4.ok, presetReason: pre4.reason ?? null, before: before4,
-            hintBefore: h0, hintAfter1: h1, hintAfter2: h2, hintCooldownMs: cfg.hintCooldownMs,
+            hintGate: hintGateOn, hintBefore: h0, hintAfter1: h1, hintAfter2: h2, hintCooldownMs: cfg.hintCooldownMs,
             route: route4, switchOk: sw4.ok, reason: sw4.reason ?? null, target: sw4.target ?? tgt4 ?? null, projection: after4,
             pass: pre4.ok === true && typeof before4 === 'string' && before4.startsWith(`${cfg.workProvider}/`)
-              && h0 === 0 && h1 === 1 && h2 === 1
+              && h0 === 0 && h1 === (hintGateOn ? 1 : 0) && h2 === (hintGateOn ? 1 : 0)
               && route4?.mode === 'chat' && sw4.ok === true
               && typeof after4 === 'string' && after4.startsWith(chatPair4) };
         } else {
