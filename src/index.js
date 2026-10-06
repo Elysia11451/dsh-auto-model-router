@@ -1243,8 +1243,8 @@ export function apply(ctx, config = {}) {
         const pending = hasPendingToolCalls(msgs);         // 任务进行中 → 冻结降档
         let st = await modeStore.read(sid);                // Map 优先，缺失读侧车（幂等 hydrate）
         if (!st) {
-          // 无状态新会话首轮：关键词预判定初始模式（chat 首写不触发事件；work 升档触发）
-          const first = kwHit ? 'work' : 'chat';
+          // 无状态新会话首轮：v0.7.8 按 source 区分初始档（main 强制 work；im/群沿用关键词预判）
+          const first = source === 'main' ? 'work' : (kwHit ? 'work' : 'chat');
           modeStore.set(sid, { mode: first, chatTurns: 0, reason: 'first-round-predict' });
           st = { mode: first, chatTurns: 0 };
         } else {
