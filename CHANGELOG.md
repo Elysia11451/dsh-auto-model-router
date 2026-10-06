@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.8] - 2026-10-06
+
+### Fixed
+- Source-aware initial session mode (src/index.js:1247 one line): main first-round forces work, im/group keeps keyword pre-judgment (commit 8c4ad20)
+- First-round read timing confirmed correct: payload.messages is the claimed batch after Inbox.claim(), no session.events read (Issue #13 pit avoided)
+- Downgrade threshold stays unified 3 rounds for im and main; no classifier/keyword changes
+
 ## [0.7.5] - 2026-10-06
 
 ### Added
