@@ -2,17 +2,23 @@
     - id: auto-model-router
       name: 'dsh-auto-model-router'
       config:
-        chatProvider: zai-coding-cn
-        chatModel: glm-5.3-flash
-        chatEffort: 'light'
-        workProvider: our-free-model
-        workModel: mimo-v2.6-flash-free
-        workEffort: deep
-        workEffortOwned: deep
-        privateChatWorkStrategy: free
+        enabled: true
+        priorityMode: manual
+        workMode: auto
+        manualWorkModel: ""
+        workModelPriority:
+          - mimo-v2.6-flash-free
+          - glm-5.3-flash
+          - deepseek-v4.1-flash
         workModelFallback: mimo-v2.6-flash-free
-        hintCooldownMs: 300000
         enableDynamicRanking: true
+        rankingRefreshSeconds: 3600
+        chatMode: auto
+        manualChatModel: ""
+        chatModelPriority:
+          - zai-coding-cn/glm-5.3-flash
+          - deepseek/deepseek-chat
+        enableGroupHint: false
+        hintCooldownMs: 300000
+        switchCooldownMs: 5000
         reclaimUnknownModel: true
-        manualWorkModel: ''
-        manualWorkModelLocked: false
