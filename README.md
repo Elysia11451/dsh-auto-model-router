@@ -96,6 +96,12 @@ dsh plugin --profile web exec auto-model-router.selftest
 
 感谢两位作者的无私开源，让这个插件有机会站在巨人的肩膀上。
 
+## 关于作者
+
+一个零基础开发者，用 AI 辅助完成了人生第一个开源项目。在这个过程中，最大的收获是学会了如何清晰地表达需求、如何把想法拆解成 AI 能理解的任务。
+
+本项目从设计到实现，大量使用了 AI 工具。
+
 ## License
 
 MIT — 见 [LICENSE](./LICENSE)。
