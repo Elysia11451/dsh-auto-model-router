@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.8.5 (2026-10-07)
+
+### 新增
+- 三层判定逻辑（状态机 → 关键词兜底 → 默认 chat）
+- 首轮弹窗选择 Chat/Work 档（DSH 主界面已验证，IM 通道待 v0.8.6）
+- deepseek provider 声明修复
+- chatModelPriority 默认改为空数组，不预设 provider，用户自行配置
+- 空数组时回退到 workModelFallback，日志 reason=chat-chain-empty
+
+### 修复
+- 冷却机制按方向区分（升档放行，降档冷却）
+- decision 日志补 switchError 字段
+
+### 测试
+- 138 用例全绿（router 46 / session-mode 7 / crash 49 / leaderboard 30 / first-turn 6），含新增 chat-chain-empty 回退断言
+
+### 已知问题
+- ISSUE-T1: Chat 链头已从 GLM 改为 DeepSeek（GLM 额度已空）
+- ISSUE-T9b: IM 通道首轮弹窗未触发，主界面正常，留待 v0.8.6
+- ISSUE-W1: 首轮手动选择被覆盖（首轮默认 chat 真切覆盖手选 work 档模型，弹窗选 Work 后可纠回）
+- ISSUE-P3-1: 关键词覆盖不足（3 条边界消息误判：查一下当前目录/跑一下测试/调用工具试试）
+
 ## [0.8.0] - 2026-10-06
 
 ### Added

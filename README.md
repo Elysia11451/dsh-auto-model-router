@@ -1,8 +1,20 @@
 # dsh-auto-model-router
 
-一个按会话来源自动切换模型与推理档位的 DSH 插件：IM 聊天走省 token 模型，Agent 工作走 our-free-model 最强模型最高档。
+一个按会话来源自动切换模型与推理档位的 DSH 插件。
 
-> 未在移动端验证。（在本机 Termux/桌面 Web 环境通过本地测试；dsh-mobile-apk 真机验证后更新此标注。）
+## 核心特性
+
+1. **双档路由**：IM 闲聊走 Chat 档（省 token），Agent 干活走 Work 档（免费池动态最强，effort deep）。
+2. **三层判定**：状态机 → 关键词兜底 → 默认 chat，关键词不反向覆盖状态机。
+3. **首轮弹窗**：新会话首轮弹出 Chat/Work 选择（DSH 主界面已验证，IM 通道待 v0.8.6）。
+4. **方向性冷却**：chat→work 升档直通，降档受 switchCooldownMs 冷却约束。
+5. **手动绝对优先**：用户 durable 选择非本路由来源时一律不覆盖（reclaimUnknownModel 开关管外部漂移纠偏）。
+
+## 安装
+
+```sh
+dsh plugin --profile web add dsh-auto-model-router
+```
 
 ## 工作原理
 
@@ -27,7 +39,9 @@
 dsh plugin --profile web add <git-url-or-path-of-dsh-auto-model-router>
 ```
 
-## 配置
+## 配置（15 个 volatile 字段 + 首轮弹窗）
+
+`chatModelPriority` 默认**空数组**——不预设任何 provider，用户按 `provider/model` 自行配置（按成本从低到高）。空数组时 chat 路由回退 `workModelFallback`，日志 `reason=chat-chain-empty`。
 
 在 profile patch 行上覆盖（与 `cordis.patch.yml` 同 id）：
 
@@ -77,20 +91,32 @@ node test/leaderboard.test.mjs  # 排行榜 19 用例（含 OpenRouter 真数据
 
 ## 已知限制
 
+- **IM 首轮弹窗待 v0.8.6**：QQ/微信新会话首轮弹窗未触发（IM 桥 session 绑定时机问题），降级为静默 chat + 次轮 keyword-upgrade 自然纠正；DSH 主界面已验证可弹。
+- **首轮手动选择被覆盖（ISSUE-W1）**：手选 work 档模型 + 首轮 route=chat 时，首轮默认 chat 真切会覆盖一次，弹窗选 Work 后可纠回。
+- **关键词覆盖不足（ISSUE-P3-1）**：`查一下当前目录`/`跑一下测试`/`调用工具试试` 3 条边界误判 chat 档，次轮可升 work。
 - 移动端 DSH 存在孤儿进程占用 3080 端口的已知问题。若遇冷启动白屏，先执行 `bash scripts/clean-port.sh` 释放端口，再启动 DSH。若脚本无效，物理重启手机。
 - 群聊提示只到日志层，未做 IM 对话内 at 提示（需要 IM bridge 的发送能力，后续版本再接）。
-- `chatProvider/chatModel` 默认指向用户自有 API（`zai-coding-cn / glm-5.3-flash`），无该 provider 的环境请自行覆盖。
-- 动态榜单依赖公网访问 `openrouter.ai`；无网络时自动回退本地 `workModel`。
-- 未在移动端验证（见顶部标注）。
+- 动态榜单依赖公网访问 `openrouter.ai`；无网络时自动回退本地 `workModelFallback`。
 
 ## 隐私声明
 
 使用 `our-free-model` 时，请求数据可能发往 OpenCode Zen 等第三方免费模型网关。请不要发送密码、密钥、个人身份信息等敏感内容。
 
-## 引用致谢
+## 依赖与致谢
 
-- 路由思路参考社区插件实践（`tools/pre-execute` + `next()` 放行模式），实现均为本仓库原创代码，未复制任何第三方插件源码。
-- 免费模型能力由 `dsh-our-free-model` 提供。
+本插件的完整功能依赖以下两个社区插件，特此致谢：
+
+- [dsh-our-free-model](https://github.com/Ebony-Vinyl/dsh-our-free-model) by **@Ebony-Vinyl**
+  Work 档的免费模型池来源。没有它，Work 档无法动态选模型。
+
+- [@xmanrui/dsh-im](https://github.com/xmanrui/dsh-im) by **@xmanrui**
+  IM 通道桥接。没有它，微信/QQ/TG 无法接收路由结果。
+
+感谢两位作者的无私开源，让这个插件有机会站在巨人的肩膀上。
+
+---
+
+本项目由零代码基础开发者在无电脑、无 Root 的 Android 设备上完成，累计消耗约 2 亿免费 token。
 
 ## License
 

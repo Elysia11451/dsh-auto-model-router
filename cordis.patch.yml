@@ -15,9 +15,7 @@
         rankingRefreshSeconds: 3600
         chatMode: auto
         manualChatModel: ""
-        chatModelPriority:
-          - zai-coding-cn/glm-5.3-flash
-          - deepseek/deepseek-flash
+        chatModelPriority: []
         enableGroupHint: false
         hintCooldownMs: 300000
         switchCooldownMs: 5000

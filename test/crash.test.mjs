@@ -89,13 +89,13 @@ await t('named exports + inject', () => {
 // apply 永不抛（含注册失败）
 await t('apply never throws on register failure', () => {
   const { ctx } = makeCtx({ failRegister: true });
-  assert.doesNotThrow(() => apply(ctx, {}));
+  assert.doesNotThrow(() => apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'] }));
 });
 
 // 异常 exec（undefined 字段 / kind 未定义注入）不崩溃且放行
 await t('malformed exec still passes through', async () => {
   const { ctx, handlers } = makeCtx();
-  apply(ctx, {});
+  apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'] });
   for (const bad of [{}, { args: null }, { agent: null }, { args: { kind: undefined } }, null]) {
     const res = await runPre(handlers, bad || {});
     assert.equal(res?.kind, 'allow');
@@ -105,7 +105,7 @@ await t('malformed exec still passes through', async () => {
 // next 本身抛错也不向上传播
 await t('next throwing does not propagate', async () => {
   const { ctx, handlers } = makeCtx();
-  apply(ctx, {});
+  apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'] });
   const h = handlers['tools/pre-execute'];
   const res = await h({ args: 'x' }, async () => { throw new Error('downstream boom'); });
   assert.equal(res?.kind, 'allow');
@@ -114,7 +114,7 @@ await t('next throwing does not propagate', async () => {
 // free-model 缺失降级：llm 为空时 apply 不抛，钩子照常放行
 await t('missing free-model degrades, never crashes', async () => {
   const { ctx, handlers } = makeCtx({ llm: null });
-  assert.doesNotThrow(() => apply(ctx, {}));
+  assert.doesNotThrow(() => apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'] }));
   const res = await runPre(handlers, { args: 'hello' });
   assert.equal(res?.kind, 'allow');
 });
@@ -122,7 +122,7 @@ await t('missing free-model degrades, never crashes', async () => {
 // 注解不污染原字段
 await t('annotation is namespaced', async () => {
   const { ctx, handlers } = makeCtx();
-  apply(ctx, {});
+  apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'] });
   const exec = { args: '帮我装插件', agent: {} };
   await runPre(handlers, exec);
   assert.equal(exec.autoModelRouter?.route, 'work');
@@ -132,7 +132,7 @@ await t('annotation is namespaced', async () => {
 // 真切（v0.7.2 阶段三：走 pre-step 状态机路径）：IM 闲聊切 chat 档，sessionId 直传 + effort 归一化
 await t('real switch passes sessionId through with normalized effort', async () => {
   const { ctx, handlers, calls } = makeCtx();
-  apply(ctx, {});
+  apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'] });
   await runStep(handlers, { text: '今天天气怎么样', sid: 'session-aaa', meta: { channel: 'weixin' } });
   await new Promise((r) => setTimeout(r, 50));
   assert.equal(calls.length, 1);
@@ -150,7 +150,7 @@ await t('saveSelection intercepted to report-only', async () => {
     async saveSelection(next) { writes.push(next); },
   };
   const { ctx } = makeCtx({ admImpl: adm });
-  apply(ctx, {});
+  apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'] });
   await adm.saveSelection({ provider: 'zai-coding-cn', model: 'glm-5.3-flash' });
   assert.equal(writes.length, 0);
   assert.equal(adm.__autoModelRouterGuard, true);
@@ -164,7 +164,7 @@ await t('global default untouched when intercept active (no pollution)', async (
     async saveSelection(next) { saved.push(next); },
   };
   const { ctx, handlers } = makeCtx({ admImpl: adm });
-  apply(ctx, {});
+  apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'] });
   const exec = { args: 'hi', agent: { session: 'session-bbb', source: { channel: 'qq' } } };
   await runPre(handlers, exec);
   await new Promise((r) => setTimeout(r, 50));
@@ -177,7 +177,7 @@ await t('no-menu model retries without effort', async () => {
   const { ctx, handlers, calls } = makeCtx({
     selectImpl: async (p) => { n++; if (n === 1 && p.reasoningEffort) { const e = new Error('unsupported effort'); e.code = 'session/model-unavailable'; throw e; } return { selected: { ...p } }; },
   });
-  apply(ctx, {});
+  apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'] });
   await runStep(handlers, { text: 'hi', sid: 'session-ccc' });
   await new Promise((r) => setTimeout(r, 50));
   assert.equal(calls.length, 2);
@@ -188,7 +188,7 @@ await t('no-menu model retries without effort', async () => {
 await t('switch failure still passes through', async () => {
   await withTmpLog(async (readLines) => {
     const { ctx, handlers } = makeCtx({ selectImpl: async () => { throw new Error('controller down'); } });
-    apply(ctx, {});
+    apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'] });
     const res = await runStep(handlers, { text: 'hi', sid: 'session-ddd' });
     assert.equal(res?.kind, 'allow');
     await new Promise((r) => setTimeout(r, 50));
@@ -202,7 +202,7 @@ await t('switch failure still passes through', async () => {
 // 节流：同一会话 60s 内不重复切
 await t('same-session switch throttled', async () => {
   const { ctx, handlers, calls } = makeCtx();
-  apply(ctx, {});
+  apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'] });
   for (let i = 1; i <= 3; i++) {
     await runStep(handlers, { text: 'hi', sid: 'session-eee', turn: i });
   }
@@ -220,7 +220,7 @@ await t('exact same model kept, not re-switched', async () => {
       stateOf: () => ({ pending: { provider: 'our-free-model', model: 'mimo-v2.6-flash-free', reasoningEffort: 'deep' } }),
     };
     ctx.sessions = { get: () => ({}) };
-    apply(ctx, {});
+    apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'] });
     const res = await runStep(handlers, { text: '帮我装插件', sid: 'session-manual', meta: {}, turn: 1 });
     assert.equal(res?.kind, 'allow');
     await new Promise((r) => setTimeout(r, 50));
@@ -244,7 +244,7 @@ await t('durable manual selection never overridden (cross-model)', async () => {
     const proj = { pending: { provider: 'our-free-model', model: 'muse-spark-1.3-contributor-free', reasoningEffort: 'deep' } };
     ctx.sessionProjections = { stateOf: () => ({ lastUsed: null, pending: proj.pending }) };
     ctx.sessions = { get: () => ({}) };
-    apply(ctx, { reclaimUnknownModel: false }); // v0.5.3：守关闭纠偏时的手动优先（默认开启时未知1.3会被纠偏）
+    apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'], reclaimUnknownModel: false }); // v0.5.3：守关闭纠偏时的手动优先（默认开启时未知1.3会被纠偏）
     const res = await runStep(handlers, { text: '帮我装插件', sid: 'session-crossmodel', meta: {}, turn: 1 });
     assert.equal(res?.kind, 'allow');
     await new Promise((r) => setTimeout(r, 50));
@@ -271,7 +271,7 @@ await t('durable chat selection rerouted under work command when ledger empty (c
       stateOf: () => ({ lastUsed: null, pending: { provider: 'zai-coding-cn', model: 'glm-5.3-flash', reasoningEffort: 'light' } }),
     };
     ctx.sessions = { get: () => ({}) };
-    apply(ctx, {});
+    apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'] });
     await runStep(handlers, { text: '帮我装插件', sid: 'session-cross', meta: {}, turn: 1 });
     await new Promise((r) => setTimeout(r, 50));
     assert.equal(calls.length, 0, 'T1 first-turn chat same-kind stays kept (no switch)');
@@ -294,7 +294,7 @@ await t('same-kind chat kept', async () => {
       stateOf: () => ({ pending: { provider: 'zai-coding-cn', model: 'glm-5.3-flash', reasoningEffort: 'light' } }),
     };
     ctx.sessions = { get: () => ({}) };
-    apply(ctx, {});
+    apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'] });
     await runStep(handlers, { text: '今天天气怎么样', sid: 'session-chatkeep', meta: { channel: 'weixin' } });
     await new Promise((r) => setTimeout(r, 50));
     assert.equal(calls.length, 0, 'already on chat must not re-switch');
@@ -338,7 +338,7 @@ await t('enableDynamicRanking=false never fetches OpenRouter', async () => {
   globalThis.fetch = async (url, ...rest) => { urls.push(String(url)); return origFetch(url, ...rest); };
   try {
     const { ctx, handlers, calls } = makeCtx();
-    apply(ctx, { enableDynamicRanking: false });
+    apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'], enableDynamicRanking: false });
     await new Promise((r) => setTimeout(r, 80)); // 等 apply 预热链跑完
     await runStep(handlers, { text: '帮我装插件', sid: 'session-dynoff', meta: {} });
     await new Promise((r) => setTimeout(r, 80)); // 等 ensureFresh 后台链跑完
@@ -361,7 +361,7 @@ await t('durable request header blocks switching', async () => {
     const hdr = { on: false };
     ctx.sessionProjections = { stateOf: () => ({ lastUsed: null, pending: null }) };
     ctx.sessions = { get: () => (hdr.on ? { requestHeader: () => ({ config: { provider: 'our-free-model', model: 'muse-spark-1.3-contributor-free', reasoningEffort: 'deep' } }) } : ({})) };
-    apply(ctx, { reclaimUnknownModel: false });
+    apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'], reclaimUnknownModel: false });
     await runStep(handlers, { text: '帮我装插件', sid: 'session-hdr', meta: {}, turn: 1 });
     await new Promise((r) => setTimeout(r, 50));
     assert.equal(calls.length, 1, 'T1 first-turn chat switch primes ledger');
@@ -381,7 +381,7 @@ await t('unreadable selection state keeps conservatively', async () => {
   await withTmpLog(async (readLines) => {
     const { ctx, handlers, calls } = makeCtx();
     ctx.sessions = { get: () => null };
-    apply(ctx, {});
+    apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'] });
     await runStep(handlers, { text: '帮我装插件', sid: 'session-unreadable', meta: {} });
     await new Promise((r) => setTimeout(r, 50));
     assert.equal(calls.length, 0, 'unknown state must not switch');
@@ -394,7 +394,7 @@ await t('unreadable selection state keeps conservatively', async () => {
 // 功能二：锁开 -> 工作真切落手动 pair（故意 ≠ 回退值，证明压过动态/回退）
 await t('manual work-model lock forces manual target', async () => {
   const { ctx, handlers, calls } = makeCtx();
-  apply(ctx, { manualWorkModelLocked: true, manualWorkModel: 'our-free-model/muse-spark-1.3-contributor-free' });
+  apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'], manualWorkModelLocked: true, manualWorkModel: 'our-free-model/muse-spark-1.3-contributor-free' });
   await withTmpLog(async (readLines) => {
     // v0.8.0 两轮断言：T1 首轮默认 chat；T2 work 路由命中手动锁目标
     await runStep(handlers, { text: '帮我装插件', sid: 'session-lockon', meta: {}, turn: 1 });
@@ -415,7 +415,7 @@ await t('manual work-model lock forces manual target', async () => {
 // 功能二：锁关（配了值也不生效）-> 走动态/回退
 await t('manual lock disabled falls back to dynamic/fallback', async () => {
   const { ctx, handlers, calls } = makeCtx();
-  apply(ctx, { manualWorkModelLocked: false, manualWorkModel: 'our-free-model/muse-spark-1.3-contributor-free' });
+  apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'], manualWorkModelLocked: false, manualWorkModel: 'our-free-model/muse-spark-1.3-contributor-free' });
   await runStep(handlers, { text: '帮我装插件', sid: 'session-lockoff', meta: {} });
   await new Promise((r) => setTimeout(r, 50));
   assert.equal(calls.length, 1);
@@ -425,7 +425,7 @@ await t('manual lock disabled falls back to dynamic/fallback', async () => {
 // 功能二：锁开但值为空 -> 不构成锁（规格：manualWorkModel 默认空即回退动态）
 await t('lock enabled with empty manualWorkModel is inert', async () => {
   const { ctx, handlers, calls } = makeCtx();
-  apply(ctx, { manualWorkModelLocked: true, manualWorkModel: '' });
+  apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'], manualWorkModelLocked: true, manualWorkModel: '' });
   await runStep(handlers, { text: '帮我装插件', sid: 'session-lockempty', meta: {} });
   await new Promise((r) => setTimeout(r, 50));
   assert.equal(calls.length, 1);
@@ -449,10 +449,8 @@ await t('static chain walks to second entry when head unavailable (v0.7.0 wiring
   process.env.DSH_HOME = home;
   try {
     const { ctx, handlers, calls } = makeCtx();
-    apply(ctx, {
-      enableDynamicRanking: false,
-      workModelPriority: ['mimo-v2.6-flash-free', 'glm-5.3-flash', 'deepseek-v4.1-flash'],
-    });
+    apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'], enableDynamicRanking: false,
+      workModelPriority: ['mimo-v2.6-flash-free', 'glm-5.3-flash', 'deepseek-v4.1-flash'], });
     // v0.8.0 两轮断言：T1 首轮默认 chat；T2 状态机已 work → 静态链解析到第二位
     // 清单加载是 apply 内 fire-and-forget：等它读完夹具文件
     await new Promise((r) => setTimeout(r, 300));
@@ -473,7 +471,7 @@ await t('router-made selection allows re-routing (ledger match)', async () => {
   const { ctx, handlers, calls } = makeCtx();
   const proj = { pending: null };
   ctx.sessionProjections = { stateOf: () => ({ lastUsed: null, pending: proj.pending }) };
-  apply(ctx, {});
+  apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'] });
   const sid = 'session-ledger-match';
   await withTmpLog(async (readLines) => {
     // 1) 全新会话闲聊 → 切 chat 成功（realSwitch 成功即写 lastSwitch 台账）
@@ -499,7 +497,7 @@ await t('foreign selection kept even when ledger exists', async () => {
   const { ctx, handlers, calls } = makeCtx();
   const proj = { pending: null };
   ctx.sessionProjections = { stateOf: () => ({ lastUsed: null, pending: proj.pending }) };
-  apply(ctx, { reclaimUnknownModel: false });
+  apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'], reclaimUnknownModel: false });
   const sid = 'session-ledger-foreign';
   await withTmpLog(async (readLines) => {
     await runStep(handlers, { text: '今天天气怎么样', sid, turn: 1 });
@@ -523,7 +521,7 @@ await t('cold-start empty ledger reroutes chat from work lane (not kept)', async
     stateOf: () => ({ lastUsed: null, pending: { provider: 'our-free-model', model: 'muse-spark-1.2-contributor-free', reasoningEffort: 'deep' } }),
   };
   ctx.sessions = { get: () => ({}) };
-  apply(ctx, {});
+  apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'] });
   await withTmpLog(async (readLines) => {
     await runStep(handlers, { text: '你现在的模型是？', sid: 'session-cold-chat' });
     await new Promise((r) => setTimeout(r, 50));
@@ -544,7 +542,7 @@ await t('cold-start empty ledger reroutes work from chat lane (not kept)', async
     stateOf: () => ({ lastUsed: null, pending: { provider: 'zai-coding-cn', model: 'glm-5.3-flash', reasoningEffort: 'light' } }),
   };
   ctx.sessions = { get: () => ({}) };
-  apply(ctx, {});
+  apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'] });
   await withTmpLog(async (readLines) => {
     await runStep(handlers, { text: '帮我装插件', sid: 'session-cold-work', turn: 1 });
     await new Promise((r) => setTimeout(r, 50));
@@ -568,7 +566,7 @@ await t('cold-start same lane stays kept (not rerouted)', async () => {
     stateOf: () => ({ lastUsed: null, pending: { provider: 'our-free-model', model: 'muse-spark-1.2-contributor-free', reasoningEffort: 'deep' } }),
   };
   ctx.sessions = { get: () => ({}) };
-  apply(ctx, { reclaimUnknownModel: false });
+  apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'], reclaimUnknownModel: false });
   await runStep(handlers, { text: '帮我装插件', sid: 'session-cold-same' });
   await new Promise((r) => setTimeout(r, 50));
   // 工作指令目标同 provider → 同类保持（shouldSwitch 精确同类，或 manual 门保守），绝不真切
@@ -584,7 +582,7 @@ await t('reclaim unknown model=true forces switch back to chat target', async ()
   const { ctx, handlers, calls } = makeCtx();
   const proj = { pending: null };
   ctx.sessionProjections = { stateOf: () => ({ lastUsed: null, pending: proj.pending }) };
-  apply(ctx, {});
+  apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'] });
   const sid = 'session-reclaim-on';
   await withTmpLog(async (readLines) => {
     // 1) 闲聊建立路由自有台账（lastSwitch）+ chat 状态（状态机下 step2 才路由 chat）
@@ -617,7 +615,7 @@ await t('reclaim unknown model=false keeps conservatively (no switch)', async ()
   const { ctx, handlers, calls } = makeCtx();
   const proj = { pending: null };
   ctx.sessionProjections = { stateOf: () => ({ lastUsed: null, pending: proj.pending }) };
-  apply(ctx, { reclaimUnknownModel: false });
+  apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'], reclaimUnknownModel: false });
   const sid = 'session-reclaim-off';
   await withTmpLog(async (readLines) => {
     await runStep(handlers, { text: '今天天气怎么样', sid, turn: 1 });
@@ -655,7 +653,7 @@ await t('auto-continue retry notice skipped (system-retry-skipped, no switch)', 
   process.env.DSH_HOME = home;
   try {
     const { ctx, handlers, calls } = makeCtx();
-    apply(ctx, { enableDynamicRanking: false });
+    apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'], enableDynamicRanking: false });
     const h = handlers['agent/pre-step'];
     assert.equal(typeof h, 'function', 'pre-step hook must be registered');
     const sid = 'session-srcfilter-notice';
@@ -700,7 +698,7 @@ await t('non-user kind message skipped (system-retry-skipped, no switch)', async
   process.env.DSH_HOME = home;
   try {
     const { ctx, handlers, calls } = makeCtx();
-    apply(ctx, { enableDynamicRanking: false });
+    apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'], enableDynamicRanking: false });
     const h = handlers['agent/pre-step'];
     const sid = 'session-srcfilter-sys';
     let nextCalled = 0;
@@ -734,7 +732,7 @@ await t('human message routes normally (kind=user, switch issued)', async () => 
   process.env.DSH_HOME = home;
   try {
     const { ctx, handlers, calls } = makeCtx();
-    apply(ctx, { enableDynamicRanking: false });
+    apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'], enableDynamicRanking: false });
     const h = handlers['agent/pre-step'];
     const sid = 'session-srcfilter-human';
     let nextCalled = 0;
@@ -767,7 +765,7 @@ await t('human message routes normally (kind=user, switch issued)', async () => 
 await t('JSONL mode/chatTurns + mode-changed event on upgrade (stage-3)', async () => {
   await withTmpLog(async (readLines) => {
     const { ctx, handlers } = makeCtx();
-    apply(ctx, { enableDynamicRanking: false });
+    apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'], enableDynamicRanking: false });
     const sid = 'session-stage3-log';
     // 1) pre-step 首条真人消息：无关键词 → 首轮预判落 chat
     await runStep(handlers, { text: '今天天气怎么样', sid, meta: { channel: 'main' }, turn: 1 });
@@ -815,7 +813,7 @@ await t('JSONL mode/chatTurns + mode-changed event on upgrade (stage-3)', async 
 await t('v0.7.5 enabled=false logs only, never switches', async () => {
   await withTmpLog(async (readLines) => {
     const { ctx, handlers, calls } = makeCtx();
-    apply(ctx, { enabled: false });
+    apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'], enabled: false });
     await runStep(handlers, { text: '帮我装插件', sid: 'session-disabled', meta: {} });
     await new Promise((r) => setTimeout(r, 50));
     assert.equal(calls.length, 0, 'disabled plugin must not switch any model');
@@ -835,7 +833,7 @@ await t('v0.7.5 priorityMode=auto overrides manual keep (routing wins)', async (
       stateOf: () => ({ lastUsed: null, pending: { provider: 'our-free-model', model: 'muse-spark-1.3-contributor-free', reasoningEffort: 'deep' } }),
     };
     ctx.sessions = { get: () => ({}) };
-    apply(ctx, { reclaimUnknownModel: false, priorityMode: 'auto' });
+    apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'], reclaimUnknownModel: false, priorityMode: 'auto' });
     await runStep(handlers, { text: '帮我装插件', sid: 'session-pmode-auto', meta: {} });
     await new Promise((r) => setTimeout(r, 50));
     assert.equal(calls.length, 1, 'auto priority must let routing override the manual keep');
@@ -856,7 +854,7 @@ await t('v0.7.5 priorityMode=manual keeps manual selection', async () => {
       stateOf: () => ({ lastUsed: null, pending: proj.on ? { provider: 'our-free-model', model: 'muse-spark-1.3-contributor-free', reasoningEffort: 'deep' } : null }),
     };
     ctx.sessions = { get: () => ({}) };
-    apply(ctx, { reclaimUnknownModel: false, priorityMode: 'manual' });
+    apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'], reclaimUnknownModel: false, priorityMode: 'manual' });
     await runStep(handlers, { text: '帮我装插件', sid: 'session-pmode-manual', meta: {}, turn: 1 });
     await new Promise((r) => setTimeout(r, 50));
     assert.equal(calls.length, 1, 'T1 first-turn chat switch primes ledger');
@@ -882,7 +880,7 @@ await t('v0.7.5 enableGroupHint gate: off = silent, on = hint once with cooldown
     ctx.logger = () => ({ info: (m) => logs.push(String(m)), warn: () => {}, error: () => {} });
     ctx.sessionProjections = groupProj();
     ctx.sessions = { get: () => ({}) };
-    apply(ctx, { enableGroupHint: false, enableDynamicRanking: false });
+    apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'], enableGroupHint: false, enableDynamicRanking: false });
     await runStep(handlers, { text: '哈哈哈', sid: 'session-hint-off', meta: { channel: 'qq', chatType: 'group' }, turn: 1 });
     await new Promise((r) => setTimeout(r, 50));
     assert.equal(logs.filter((m) => m.includes('group hint for session')).length, 0, 'disabled hint must stay silent');
@@ -894,7 +892,7 @@ await t('v0.7.5 enableGroupHint gate: off = silent, on = hint once with cooldown
     ctx.logger = () => ({ info: (m) => logs.push(String(m)), warn: () => {}, error: () => {} });
     ctx.sessionProjections = groupProj();
     ctx.sessions = { get: () => ({}) };
-    apply(ctx, { enableGroupHint: true, enableDynamicRanking: false });
+    apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'], enableGroupHint: true, enableDynamicRanking: false });
     const hintCount = () => logs.filter((m) => m.includes('group hint for session')).length;
     await runStep(handlers, { text: '哈哈哈', sid: 'session-hint-on', meta: { channel: 'qq', chatType: 'group' }, turn: 1 });
     await new Promise((r) => setTimeout(r, 50));
@@ -909,7 +907,7 @@ await t('v0.7.5 enableGroupHint gate: off = silent, on = hint once with cooldown
 await t('v0.7.5 chatMode=manual pins manualChatModel', async () => {
   await withTmpLog(async (readLines) => {
     const { ctx, handlers, calls } = makeCtx();
-    apply(ctx, { chatMode: 'manual', manualChatModel: 'my-api/glm-x' });
+    apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'], chatMode: 'manual', manualChatModel: 'my-api/glm-x' });
     await runStep(handlers, { text: '你好', sid: 'session-chatmanual', meta: { channel: 'weixin' } });
     await new Promise((r) => setTimeout(r, 50));
     assert.equal(calls.length, 1);
@@ -922,10 +920,11 @@ await t('v0.7.5 chatMode=manual pins manualChatModel', async () => {
 });
 
 // 分支四 chat：chatMode=auto ⇒ 忽略 manualChatModel，走 chatModelPriority 链头，branch=chat-auto-chain
+// v0.8.5：chatModelPriority 默认空数组——本用例显式传链，保持"auto 忽略 manual 锁"测试本意。
 await t('v0.7.5 chatMode=auto ignores manualChatModel (priority chain head)', async () => {
   await withTmpLog(async (readLines) => {
     const { ctx, handlers, calls } = makeCtx();
-    apply(ctx, { chatMode: 'auto', manualChatModel: 'my-api/glm-x' });
+    apply(ctx, { chatMode: 'auto', manualChatModel: 'my-api/glm-x', chatModelPriority: ['zai-coding-cn/glm-5.3-flash'] });
     await runStep(handlers, { text: '你好', sid: 'session-chatauto', meta: { channel: 'weixin' } });
     await new Promise((r) => setTimeout(r, 50));
     assert.equal(calls.length, 1);
@@ -937,12 +936,29 @@ await t('v0.7.5 chatMode=auto ignores manualChatModel (priority chain head)', as
   });
 });
 
+// v0.8.5 新增：chatModelPriority 空链 ⇒ reason=chat-chain-empty，回退 workModelFallback（branch 照旧 chat-auto-chain）
+// 参考 dsh-llm-fallbacks：链尾恒可用兜底，链空/全不中时自动回退，不抛空目标。
+await t('v0.8.5 chat-chain-empty falls back to workModelFallback', async () => {
+  await withTmpLog(async (readLines) => {
+    const { ctx, handlers, calls } = makeCtx();
+    apply(ctx, { chatMode: 'auto', chatModelPriority: [], workModelFallback: 'mimo-v2.6-flash-free', firstTurnPrompt: false });
+    await runStep(handlers, { text: '你好', sid: 'session-chainempty', meta: { channel: 'weixin' } });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].provider, 'our-free-model');
+    assert.equal(calls[0].model, 'mimo-v2.6-flash-free');
+    const decision = await waitLine(readLines,(l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-chainempty');
+    assert.ok(decision, 'decision line must exist');
+    assert.equal(decision.branch, 'chat-auto-chain');
+  });
+});
+
 // 分支四 work：workMode=manual ⇒ 固定 manualWorkModel，branch=work-manual-locked（新字段路径，非 legacy 键）
 // v0.8.0 首轮弹窗：新会话首轮默认 chat 放行，干活关键词第二轮才升 work —— 两轮断言。
 await t('v0.7.5 workMode=manual pins manualWorkModel', async () => {
   await withTmpLog(async (readLines) => {
     const { ctx, handlers, calls } = makeCtx();
-    apply(ctx, { workMode: 'manual', manualWorkModel: 'our-free-model/muse-spark-1.3-contributor-free', firstTurnPrompt: false });
+    apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'], workMode: 'manual', manualWorkModel: 'our-free-model/muse-spark-1.3-contributor-free', firstTurnPrompt: false });
     await runStep(handlers, { text: '帮我装插件', sid: 'session-workmanual', meta: {} });
     await new Promise((r) => setTimeout(r, 50));
     await runStep(handlers, { text: '帮我装插件', sid: 'session-workmanual', meta: {}, turn: 2 });
@@ -960,7 +976,7 @@ await t('v0.7.5 workMode=manual pins manualWorkModel', async () => {
 await t('v0.7.5 workMode=auto ignores manualWorkModel (chain/fallback)', async () => {
   await withTmpLog(async (readLines) => {
     const { ctx, handlers, calls } = makeCtx();
-    apply(ctx, { workMode: 'auto', manualWorkModel: 'our-free-model/muse-spark-1.3-contributor-free', enableDynamicRanking: false, firstTurnPrompt: false });
+    apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'], workMode: 'auto', manualWorkModel: 'our-free-model/muse-spark-1.3-contributor-free', enableDynamicRanking: false, firstTurnPrompt: false });
     await runStep(handlers, { text: '帮我装插件', sid: 'session-workauto', meta: {} });
     await new Promise((r) => setTimeout(r, 50));
     await runStep(handlers, { text: '帮我装插件', sid: 'session-workauto', meta: {}, turn: 2 });
@@ -971,6 +987,91 @@ await t('v0.7.5 workMode=auto ignores manualWorkModel (chain/fallback)', async (
     const decision = await waitLine(readLines,(l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-workauto' && l.turn === 2);
     assert.ok(decision, 'turn2 decision line must exist');
     assert.equal(decision.branch, 'work-auto-chain');
+  });
+});
+
+// ── v0.8.5 Part5：Part2 缺口补测试（reason 串直接断言 + no-selection 位置）──
+
+// 缺口1a：T2 同目标 → keepReason 精确等于 'same-kind-kept'（Part2 仅 user-manual/enabled-off 有串断言）
+await t('v0.8.5 assert: T2 same target -> keepReason=same-kind-kept', async () => {
+  await withTmpLog(async (readLines) => {
+    const { ctx, handlers, calls } = makeCtx();
+    apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'], firstTurnPrompt: false, enableDynamicRanking: false });
+    await runStep(handlers, { text: '今天天气怎么样', sid: 'session-rsamekind', meta: { channel: 'qq' }, turn: 1 });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(calls.length, 1, 'T1 primes ledger with chat target');
+    await runStep(handlers, { text: '今天天气怎么样', sid: 'session-rsamekind', meta: { channel: 'qq' }, turn: 2 });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(calls.length, 1, 'T2 must not switch again');
+    const decision = await waitLine(readLines, (l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-rsamekind' && l.turn === 2);
+    assert.ok(decision, 'turn2 decision line must exist');
+    assert.equal(decision.keepReason, 'same-kind-kept');
+    assert.notEqual(decision.switched, true);
+  });
+});
+
+// 缺口1b：work 升档后 5s 内发闲聊 → decision.switchError 精确等于 'downgrade-cooldown-blocked'
+// 五轮：T1 首轮强制 chat 放行真切；T2 关键词升档 work 直通冷却真切；
+// T3/T4 闲聊留在 work（状态机 task 钉 work，chat-turn-count 计数）；T5 满 3 轮 idle-3-turns
+// 降档 → 路由切 chat 目标 → 降档真切被冷却拦截（距 T2 真切 <5s）。
+// v0.8.5：显式传 chat 链（T1 chat 与 T2 work 拉开差距，否则空链回退 work 免费池导致 T2 同类不切）。
+await t('v0.8.5 assert: downgrade within cooldown -> switchError=downgrade-cooldown-blocked', async () => {
+  await withTmpLog(async (readLines) => {
+    const { ctx, handlers, calls } = makeCtx();
+    apply(ctx, { firstTurnPrompt: false, enableDynamicRanking: false, switchCooldownMs: 5000, chatModelPriority: ['deepseek/deepseek-flash'] });
+    await runStep(handlers, { text: '帮我建个文件', sid: 'session-rcool', meta: { channel: 'qq' }, turn: 1 });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(calls.length, 1, 'T1 first-turn chat switch');
+    await runStep(handlers, { text: '帮我建个文件', sid: 'session-rcool', meta: { channel: 'qq' }, turn: 2 });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(calls.length, 2, 'T2 keyword-upgrade must switch (upgrade bypasses cooldown)');
+    assert.equal(calls[1].provider, 'our-free-model', 'T2 lands on work target');
+    for (const n of [3, 4]) {
+      await runStep(handlers, { text: '今天天气怎么样', sid: 'session-rcool', meta: { channel: 'qq' }, turn: n });
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.equal(calls.length, 2, 'T3/T4 idle chat stays in work lane (no switch)');
+    await runStep(handlers, { text: '今天天气怎么样', sid: 'session-rcool', meta: { channel: 'qq' }, turn: 5 });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(calls.length, 2, 'T5 downgrade must be blocked, no third selectModel');
+    const decision = await waitLine(readLines, (l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-rcool' && l.turn === 5);
+    assert.ok(decision, 'turn5 decision line must exist');
+    assert.equal(decision.switched, false);
+    assert.equal(decision.switchError, 'downgrade-cooldown-blocked');
+  });
+});
+
+// 缺口1c：sessionController 缺失 → decision.switchError 精确等于 'no-controller'
+await t('v0.8.5 assert: missing controller -> switchError=no-controller', async () => {
+  await withTmpLog(async (readLines) => {
+    const { ctx, handlers, calls } = makeCtx();
+    delete ctx.sessionController;
+    apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'], firstTurnPrompt: false, enableDynamicRanking: false });
+    await runStep(handlers, { text: '今天天气怎么样', sid: 'session-rnoctl', meta: { channel: 'qq' }, turn: 1 });
+    const decision = await waitLine(readLines, (l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-rnoctl', 4000);
+    assert.ok(decision, 'decision line must exist (3x250ms resolve + race < 1500ms)');
+    assert.equal(decision.switched, false);
+    assert.equal(decision.switchError, 'no-controller');
+    assert.equal(calls.length, 0, 'no selectModel call without controller');
+  });
+});
+
+// 缺口2：(no-selection) 位置 —— 投影对象在场但无选择记录时，
+// pre-step 行（切换前）读回该值；decision 行（切换后重读）应为真切结果。
+await t('v0.8.5 assert: (no-selection) surfaces in pre-step line before switch', async () => {
+  await withTmpLog(async (readLines) => {
+    const { ctx, handlers, calls } = makeCtx();
+    ctx.sessionProjections = { stateOf: () => ({}) };   // 投影对象在场、无 pending/assembled
+    ctx.sessions = { get: () => ({}) };
+    apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'], firstTurnPrompt: false, enableDynamicRanking: false });
+    await runStep(handlers, { text: '今天天气怎么样', sid: 'session-rnosel', meta: { channel: 'qq' }, turn: 1 });
+    const pre = await waitLine(readLines, (l) => l.tool === 'agent/pre-step' && l.sid === 'session-rnosel' && l.turn === 1);
+    assert.ok(pre, 'pre-step line must exist');
+    assert.equal(pre.actualSel, '(no-selection)', 'read-side value must surface pre-switch');
+    const decision = await waitLine(readLines, (l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-rnosel' && l.turn === 1);
+    assert.ok(decision, 'decision line must exist');
+    assert.equal(decision.switched, true, 'no-selection is readable, not unreadable-conservative: switch proceeds');
+    assert.notEqual(decision.actualSel, '(no-selection)', 'post-switch re-read reflects the real selection');
   });
 });
 

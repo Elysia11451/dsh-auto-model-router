@@ -58,8 +58,8 @@ export const Config = Schema.object({
     .description({ zh: '手动：固定用下方填的自有 API 模型；自动：按下方降级链从便宜到贵挑', en: 'Manual: pin your owned-API model below; Auto: walk the chain below from cheapest upward' }),
   manualChatModel: Schema.string().default('').volatile()
     .description({ zh: '仅手动模式生效。格式 provider/model；裸模型名配你自己的 provider；留空回退兜底并打警告', en: 'Only used in manual mode. provider/model; bare name pairs with your provider; empty falls back with a warning' }),
-  chatModelPriority: Schema.array(Schema.string()).default(['zai-coding-cn/glm-5.3-flash', 'deepseek/deepseek-flash']).volatile()
-    .description({ zh: '仅自动模式生效。从便宜到贵排序，依次挑你配过 key 的可用者', en: 'Only used in auto mode. Cheapest-first; picks the first one you have a key for' }),
+  chatModelPriority: Schema.array(Schema.string()).default([]).volatile()
+    .description({ zh: '仅自动模式生效。请填入你自己的 API 模型，格式 provider/model，按成本从低到高排序。留空则回退免费池并打警告', en: 'Only used in auto mode. Fill in your own API models as provider/model, cheapest first. Empty falls back to the free pool with a warning' }),
   // —— 分组 D · 群聊（默认折叠，高级）——
   enableGroupHint: Schema.boolean().default(false).volatile()
     .description({ zh: '群聊工作模型提示。默认关（防打扰）；开后 work 档群聊发一次切换提示', en: 'Group work-model hint. Off by default to avoid noise' }),
@@ -150,7 +150,7 @@ export function apply(ctx, config = {}) {
     // C chat 档：legacy chatModel 在场（含空串）走 legacy；否则新字段合成
     c.chatMode = pick('chatMode', 'auto');
     c.manualChatModel = pick('manualChatModel', '');
-    c.chatModelPriority = pick('chatModelPriority', ['zai-coding-cn/glm-5.3-flash', 'deepseek/deepseek-flash']);
+    c.chatModelPriority = pick('chatModelPriority', []);
     const legacyChat = getRaw('chatModel');
     if (legacyChat !== undefined) {
       c.chatProvider = pick('chatProvider', DEFAULTS.chatProvider);
@@ -160,8 +160,14 @@ export function apply(ctx, config = {}) {
       c.chatModel = String(c.manualChatModel).trim();
     } else {
       c.chatProvider = DEFAULTS.chatProvider;
-      const head = Array.isArray(c.chatModelPriority) && c.chatModelPriority.length > 0 ? String(c.chatModelPriority[0]) : '';
-      c.chatModel = head || DEFAULTS.chatModel;
+      const chain = Array.isArray(c.chatModelPriority) ? c.chatModelPriority.map((s) => String(s ?? '').trim()).filter(Boolean) : [];
+      const head = chain.length > 0 ? chain[0] : '';
+      if (!head) {
+        // 空链：不猜模型，回退免费池占位；chatTarget() 的 resolveChatTarget-fallback 会再按
+        // owned-default → workModelFallback 逐级解析，此处仅记诊断日志。
+        safeLog(ctx, 'warn', 'chatModelPriority empty (reason=chat-chain-empty); chat route falls back to workModelFallback. Fill chatModelPriority with your own provider/model pairs.');
+      }
+      c.chatModel = head || '';
     }
     // 运维键（新 Config 已删）：legacy/单测残留照用，否则 DEFAULTS
     c.workProvider = pick('workProvider', DEFAULTS.workProvider);
