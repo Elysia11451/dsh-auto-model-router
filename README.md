@@ -96,10 +96,6 @@ dsh plugin --profile web exec auto-model-router.selftest
 
 感谢两位作者的无私开源，让这个插件有机会站在巨人的肩膀上。
 
----
-
-本项目由零代码基础开发者在无电脑、无 Root 的 Android 设备上完成，累计消耗约 2 亿免费 token。
-
 ## License
 
 MIT — 见 [LICENSE](./LICENSE)。
