@@ -159,8 +159,8 @@ await t('first-turn disabled -> no prompt, stays chat', async () => {
   });
 });
 
-// 7. v0.8.6 W1: ask 已派出答案未回 → 首轮只注解不真切（keepReason=first-turn-pending，不调 selectModel）
-await t('v0.8.6 W1: first-turn pending -> annotate-only (no switch)', async () => {
+// 7. v0.8.6 issues NTR 1: ask 已派出答案未回 → 首轮只注解不真切（keepReason=first-turn-pending，不调 selectModel）
+await t('v0.8.6 issues NTR 1: first-turn pending -> annotate-only (no switch)', async () => {
   await withTmpLog(async (readLines) => {
     // ask 永不 settle：模拟 IM 桥吞掉后悬挂
     const m = makeCtxUQ({ askImpl: () => new Promise(() => {}) });
@@ -177,8 +177,8 @@ await t('v0.8.6 W1: first-turn pending -> annotate-only (no switch)', async () =
   });
 });
 
-// 8. v0.8.6 T9b: probe + asked 双落盘（sessionReady 诊断二选一）；无 provider 时 settled 落盘
-await t('v0.8.6 T9b: probe/asked jsonl present + no-provider settled', async () => {
+// 8. v0.8.6 issues NTR 2: probe + asked 双落盘（sessionReady 诊断二选一）；无 provider 时 settled 落盘
+await t('v0.8.6 issues NTR 2: probe/asked jsonl present + no-provider settled', async () => {
   await withTmpLog(async (readLines) => {
     const m = makeCtxUQ({ hasProvider: false });
     apply(m.ctx, { enableDynamicRanking: false });

@@ -4,9 +4,9 @@
 // 口径锁定（v0.8.0）：getService(ctx,'userQuestions') + 带 live agent + 群聊不弹；
 // 任何失败（NO_PROVIDER / 超时 / child agent / abort）一律降级 chat，绝不阻塞。
 //
-// v0.8.6 W1：ask 实际派出时返回 firstTurnPending=true —— 调用方（pre-step）本轮只注解
+// v0.8.6 issues NTR 1：ask 实际派出时返回 firstTurnPending=true —— 调用方（pre-step）本轮只注解
 // 不真切，等弹窗答案落定后下一轮再切；否则首轮默认 chat 真切会覆盖用户手选 work 档模型。
-// v0.8.6 T9b：IM session 就绪探针 + asked/settled 双落盘（jsonl）+ 自超时（ask 无视
+// v0.8.6 issues NTR 2：IM session 就绪探针 + asked/settled 双落盘（jsonl）+ 自超时（ask 无视
 // AbortSignal 悬挂时的兜底）+ NO_PROVIDER 显式 warn（IM 桥吞掉时给提示）。
 //
 // 拆分铁律：本文件不 import 本域 interface.js；isGroupMeta 属 routing-policy，
@@ -67,7 +67,7 @@ export function establishFirstTurnState(o, d) {
     return { mode: 'chat', chatTurns: 0, firstTurnPending: false };
   }
   modeStore.set(sid, { mode: 'chat', chatTurns: 0, reason: 'first-turn-pending' });
-  let asked = false; // ask 是否实际派出（W1 pending 标记的唯一依据）
+  let asked = false; // ask 是否实际派出（issues NTR 1 pending 标记的唯一依据）
   try {
     const __svc = getService(ctx, 'userQuestions');
     if (!__svc || typeof __svc.ask !== 'function') {
@@ -76,7 +76,7 @@ export function establishFirstTurnState(o, d) {
       logJsonl({ sid, tool: 'first-turn/prompt-settled', mode: 'chat', reason: 'first-turn-no-provider', settled: 'skipped', err: 'no-provider' });
       return { mode: 'chat', chatTurns: 0, firstTurnPending: false };
     }
-    // v0.8.6 T9b 探针：IM 桥 session 绑定就绪检查（#D 返回 null 透传是零触发主因之一）。
+    // v0.8.6 issues NTR 2 探针：IM 桥 session 绑定就绪检查（#D 返回 null 透传是零触发主因之一）。
     // 只记录、不拦截：绑定未就绪也照常 ask（宿主 Web 端 waterfall 仍可能认领），诊断靠这一行二选一。
     let __hasAgent = false;
     let __hasSession = false;
@@ -136,7 +136,7 @@ export function establishFirstTurnState(o, d) {
         try { safeLog(ctx, 'info', `first-turn prompt skipped for session ${sid} (reason=first-turn-child-agent; child has no answerer).`); } catch { /* noop */ }
       }
     } catch { /* 无 agent 字段则降级为 agentless */ }
-    // v0.8.6 T9b 自超时：ask 可能无视 AbortSignal 悬挂（IM 桥吞掉 NO_PROVIDER 后永不 settle），
+    // v0.8.6 issues NTR 2 自超时：ask 可能无视 AbortSignal 悬挂（IM 桥吞掉 NO_PROVIDER 后永不 settle），
     // 只靠 signal 会在 QQ 侧挂到 60s 无感知。自定时器与 signal 同超时（+1s 让 signal 路径先赢），
     // 先落定者赢、迟到答案不再覆盖（与"超时后 abort 拒收"语义一致）。
     let __settled = false;
@@ -164,7 +164,7 @@ export function establishFirstTurnState(o, d) {
         try { __selfTimer.unref(); } catch { /* noop */ }
       }
     } catch { /* 自超时挂失败不阻断（signal 超时仍在） */ }
-    asked = true; // ask 即将派出：本轮 firstTurnPending=true，调用方只注解不真切（W1）
+    asked = true; // ask 即将派出：本轮 firstTurnPending=true，调用方只注解不真切（issues NTR 1）
     __svc.ask(__req).then((ans) => {
       if (__settled) return; // 自超时已先落定，迟到答案不再覆盖
       let selected = '';
@@ -190,7 +190,7 @@ export function establishFirstTurnState(o, d) {
       if (__settled) return; // 自超时已先落定，迟到拒绝不再覆盖
       const code = err?.code ?? err?.name ?? '';
       const reason = askErrorReason(err);
-      // T9b：NO_PROVIDER 显式 warn（IM 桥吞掉后 QQ 侧零感知，日志里必须一眼可见）。
+      // issues NTR 2：NO_PROVIDER 显式 warn（IM 桥吞掉后 QQ 侧零感知，日志里必须一眼可见）。
       const level = reason === 'first-turn-no-provider' ? 'warn' : 'info';
       const hint = reason === 'first-turn-no-provider'
         ? ' (no answerer claimed the prompt; IM bridge may have swallowed NO_PROVIDER — QQ first-turn degrades to silent chat, next-round keyword-upgrade corrects)'

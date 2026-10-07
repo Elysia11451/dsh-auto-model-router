@@ -117,7 +117,7 @@ export function createPreStepHandler(d) {
       //   3. 状态机：sessionMode==='work' → agent-work；==='chat' → chat
       //   4. 关键词预判：仅无状态新会话首轮定初始模式（不再全局判定）
       let smTask = null; // null = 状态机异常降级：decideRoute 内退回关键词分类（旧行为兜底）
-      let firstTurnPending = false; // v0.8.6 W1：首轮 ask 已派出 → 本轮只注解不真切
+      let firstTurnPending = false; // v0.8.6 issues NTR 1：首轮 ask 已派出 → 本轮只注解不真切
       try {
         const kwHit = classifyTask(text) === 'agent-work'; // 关键词信号（仅首轮预判 + 降档计数防抖）
         const pending = hasPendingToolCalls(msgs);         // 任务进行中 → 冻结降档
@@ -211,8 +211,8 @@ export function createPreStepHandler(d) {
           holder.autoModelRouter.keepReason = 'enabled-off';
           safeLog(ctx, 'info', `pre-step skip switch for ${sid} (reason=enabled-off; target=${origTargetStr ?? '-'}; log-only mode).`);
         } else if (firstTurnPending && target && sid && sid !== 'unknown') {
-          // v0.8.6 W1：首轮 ask 已派出、答案未回 → 本轮只注解不真切。
-          // 首轮默认 chat 真切会覆盖用户手选 work 档模型（ISSUE-W1）；等弹窗答案落定
+          // v0.8.6 issues NTR 1：首轮 ask 已派出、答案未回 → 本轮只注解不真切。
+          // 首轮默认 chat 真切会覆盖用户手选 work 档模型（issues NTR 1）；等弹窗答案落定
           // （modeStore.set reason=first-turn-prompt*）后，下一轮状态机自然给出正确路由再切。
           holder.autoModelRouter.target = null;
           holder.autoModelRouter.keepReason = 'first-turn-pending';
