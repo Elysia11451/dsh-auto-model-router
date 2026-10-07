@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { normalizeId, rankIntersection, pickTop, fetchRankOrder, createLeaderboardCache, pickWorkModelFromChain, loadRankCache, saveRankCache, OR_URL, CACHE_TTL_MS, DEFAULT_WORK_MODEL, DEFAULT_WORK_MODEL_PRIORITY } from '../src/leaderboard.js';
+import { normalizeId, rankIntersection, pickTop, fetchRankOrder, createLeaderboardCache, pickWorkModelFromChain, loadRankCache, saveRankCache, OR_URL, CACHE_TTL_MS, DEFAULT_WORK_MODEL, DEFAULT_WORK_MODEL_PRIORITY } from '../src/leaderboard/leaderboard.js';
 
 const t = (name, fn) => { try { fn(); console.log(`ok - ${name}`); } catch (e) { console.error(`FAIL - ${name}: ${e.message}`); process.exitCode = 1; } };
 const ta = async (name, fn) => { try { await fn(); console.log(`ok - ${name}`); } catch (e) { console.error(`FAIL - ${name}: ${e.message}`); process.exitCode = 1; } };

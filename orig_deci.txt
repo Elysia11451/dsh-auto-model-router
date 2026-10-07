@@ -1,0 +1,108 @@
+  function ownedDefaultTarget() {
+    try {
+      const adm = getService(ctx, 'agentDefaultModel');
+      const cur = typeof adm?.currentSelection === 'function' ? adm.currentSelection() : null;
+      const p = String(cur?.provider ?? '').trim();
+      const m = String(cur?.model ?? '').trim();
+      if (p && m && p !== 'our-free-model') return { provider: p, model: m, effort: cur?.reasoningEffort ?? undefined };
+      return null;
+    } catch { return null; }
+  }
+  function chatTarget() {
+    // chatModel 留空 = 自动用你自有 API 的默认模型（不再锁死 GLM）；
+    // 填了 = 按填的走（'prov/mod' 或裸模型名+chatProvider）；两头都空 → 回退 workModelFallback + 警告。
+    const rawChat = String(cfg.chatModel ?? '').trim();
+    if (!rawChat) {
+      const owned = ownedDefaultTarget();
+      if (owned && owned.provider && owned.model) return { ...owned, source: 'owned-default' };
+    }
+    const ct = resolveChatTarget({
+      chatProvider: cfg.chatProvider,
+      chatModel: cfg.chatModel,
+      workProvider: cfg.workProvider,
+      workModelFallback: cfg.workModelFallback || cfg.workModel || DEFAULT_WORK_MODEL,
+    });
+    if (ct.source === 'fallback' || ct.source === 'owned-default') {
+      const now = Date.now();
+      if (now - chatFallbackWarnedAt > 10 * 60 * 1000) { // 限频：10 分钟最多一条
+        chatFallbackWarnedAt = now;
+        if (ct.source === 'fallback') {
+          safeLog(ctx, 'warn', `chatModel empty + no owned default; chat route falls back to ${ct.provider}/${ct.model} (set chatModel in plugin config or configure an owned API default).`);
+        } else {
+          safeLog(ctx, 'info', `chatModel empty; chat route uses your owned API default ${ct.provider}/${ct.model}.`);
+        }
+      }
+    }
+    return ct;
+  }
+  function annotateRoute(exec, route, modelOverride) {
+    try {
+      if (!exec || typeof exec !== 'object') return;
+      let target;
+      if (route.mode === 'work' && route.workStyle === 'owned') {
+        const ct = chatTarget();
+        target = { provider: ct.provider, model: ct.model, effort: cfg.workEffortOwned || cfg.chatEffort };
+      } else if (route.mode === 'work') {
+        // 功能二：锁定时手动 pair 绝对优先（modelOverride/动态榜都让位）
+        const w = manualLock.on
+          ? { provider: manualLock.provider, model: manualLock.model }
+          : { provider: cfg.workProvider, model: modelOverride || currentWorkModel() };
+        target = { provider: w.provider, model: w.model, effort: cfg.workEffort };
+      } else {
+        const ct = chatTarget();
+        target = { provider: ct.provider, model: ct.model, effort: cfg.chatEffort };
+      }
+      // 目标不完整（配置两头都空）：只注解不真切，避免向 selectModel 传空 model。
+      if (!target?.provider || !target?.model) {
+        safeLog(ctx, 'warn', `route=${route.mode} target incomplete (provider=${target?.provider ?? ''} model=${target?.model ?? ''}); annotate-only, no switch.`);
+        exec.autoModelRouter = { ...(exec.autoModelRouter || {}), route: route.mode, task: route.task, workStyle: route.workStyle, target: null, freeModelOk };
+        return;
+      }
+      // 非侵入式注解：挂在独立命名空间下，不污染 exec 原有字段。
+      exec.autoModelRouter = { ...(exec.autoModelRouter || {}), route: route.mode, task: route.task, workStyle: route.workStyle, target, freeModelOk };
+    } catch { /* 注解失败不影响放行 */ }
+  }
+
+  // 规则三（看实际模型 + 防刷屏）：
+  //  - 对症：只看 exec.agent.model 是否命中 work 档，不看文本分类
+  //  - 防刷屏：hint_sent_until 冷却（默认 10min）+ hintMaxCount 计数（默认 20 条）双保险
+  //  - 解除：切回非 work 模型 -> 清状态；群聊明确工作指令 -> 清状态（重新起算）
+  function maybeGroupHint(ctxRef, exec, route) {
+    try {
+      // v0.7.5 Step4 分支三：enableGroupHint=false（默认）⇒ 不弹群聊提示（早退，hintState 不动）。
+      if (cfg?.enableGroupHint !== true) return;
+      const meta = exec?.agent?.source || exec?.meta || {};
+      const sessionKey = sidOf(exec) || 'unknown';
+      // 官方无 exec.agent.model 字段：读 model/selection 投影，再回退本插件切换缓存。
+      let actualModel;
+      try {
+        const sp = getService(ctx, 'sessionProjections');
+        const key = sidOf(exec);
+        const sess = typeof exec?.agent?.session === 'object' ? exec.agent.session : (key ? getService(ctx, 'sessions')?.get?.(key) : null);
+        const st = sp?.stateOf?.(sess, 'modelSelection');
+        // 修（m01290 内部模拟 s4 实锤）：判档必须带 provider——裸动态模型名（如 muse-spark-1.2…）
+        // 既不含 cfg.workModel 也不含 cfg.workProvider，isWorkModelRef 恒 false ⇒ 动态档下
+        // 群聊提示从不触发。带 provider 后走 workProvider 分支。
+        if (st && st.pending) actualModel = st.pending.provider ? `${st.pending.provider}/${st.pending.model}` : st.pending.model;
+      } catch { actualModel = undefined; }
+      if (!actualModel) {
+        const lw = lastSwitch.get(sidOf(exec));
+        if (lw) actualModel = lw.split('/').slice(0, 2).join('/');
+      }
+      const onWorkModel = isWorkModelRef(actualModel, cfg.workModel, cfg.workProvider);
+      const st = hintState.get(sessionKey);
+
+      // 解除条件 1：已切回非工作模型 -> 清状态，直接放行
+      if (!onWorkModel) {
+        if (st) hintState.delete(sessionKey);
+        return;
+      }
+      // 非群聊不提示，但保留状态（私聊 work 是正常的）
+      if (!isGroupMeta(meta)) return;
+      // 解除条件 2：群聊明确工作指令 -> 重置冷却（重新起算），不提示这次
+      if (route?.mode === 'work' && route?.task === 'agent-work') {
+        hintState.delete(sessionKey);
+        return;
+      }
+      // 冷却期内直接放行
+      const now = Date.now();

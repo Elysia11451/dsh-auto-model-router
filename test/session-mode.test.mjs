@@ -2,7 +2,7 @@
 // 验证：①模拟升档→侧车文件写入 ②模拟冷启动→Map 从侧车恢复 ③mode-changed 事件语义
 //       ④无侧车/损坏侧车冷启动默认 chat ⑤有界 >500 清最旧 ⑥非法 sid / peek 同步读
 import assert from 'node:assert/strict';
-import { createSessionModeStore, SESSION_MODE_CAP, SESSION_MODE_SIDECAR, MODE_CHANGED_EVENT } from '../src/session-mode.js';
+import { createSessionModeStore, SESSION_MODE_CAP, SESSION_MODE_SIDECAR, MODE_CHANGED_EVENT } from '../src/routing-policy/impl/session-mode.js';
 
 const fsP = await import('node:fs/promises');
 const osP = await import('node:os');

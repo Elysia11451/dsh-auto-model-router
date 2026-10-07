@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
-import { classifyTask, sourceFromMeta, isGroupMeta, isSameKind, decideRoute, buildGroupHint, normalizeEffortForSwitch, buildSelectModelPayload, resolveChatTarget, parseManualWorkLock, isColdStartCrossKind, isUnknownDrift, isWorkModelRef, nextSessionMode, DEFAULTS } from '../src/router.js';
-import { DEFAULT_WORK_MODEL_PRIORITY } from '../src/leaderboard.js';
+import { classifyTask, sourceFromMeta, isGroupMeta } from '../src/routing-policy/impl/classifier.js';
+import { isSameKind, decideRoute, buildGroupHint, normalizeEffortForSwitch, buildSelectModelPayload, resolveChatTarget, parseManualWorkLock, isColdStartCrossKind, isUnknownDrift, isWorkModelRef, nextSessionMode, DEFAULTS } from '../src/routing-policy/impl/decider.js';
+import { DEFAULT_WORK_MODEL_PRIORITY } from '../src/leaderboard/leaderboard.js';
 
 const t = (name, fn) => { try { fn(); console.log(`ok - ${name}`); } catch (e) { console.error(`FAIL - ${name}: ${e.message}`); process.exitCode = 1; } };
 

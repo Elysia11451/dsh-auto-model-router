@@ -1,6 +1,18 @@
 # Changelog
 
-## v0.8.5 (2026-10-07)
+## v0.8.6 (2026-10-07)
+
+### 修复
+- W1: 首轮弹窗已派出但答案未回时，本轮只注解不真切（keepReason=first-turn-pending），不再用默认 chat 覆盖用户手选 work 档模型；等弹窗答案落定后下一轮自然纠正
+- T9b: 首轮加 IM session 就绪探针 + asked/settled 双落盘（first-turn/probe、first-turn/prompt-asked、first-turn/prompt-settled），ask 无视 AbortSignal 悬挂时自超时兜底（timeout+1s，先落定者赢），NO_PROVIDER 显式 warn（IM 桥吞掉时日志一眼可见）
+
+### 测试
+- 140 用例全绿（router 46 / session-mode 7 / crash 49 / leaderboard 30 / first-turn 8），含新增 W1 annotate-only + T9b probe/asked 落盘断言
+
+### 已知问题
+- ISSUE-T1: Chat 链头已从 GLM 改为 DeepSeek（GLM 额度已空）
+- ISSUE-T9b 后续：IM 新会话首轮弹窗零触发的二选一诊断需生产 QQ 实测（看 probe 行 sessionReady + asked/settled 是否成对出现）
+- ISSUE-P3-1: 关键词覆盖不足（3 条边界消息误判：查一下当前目录/跑一下测试/调用工具试试，本版未动）
 
 ### 新增
 - 三层判定逻辑（状态机 → 关键词兜底 → 默认 chat）

@@ -250,7 +250,7 @@ window.__ModuleLoader__.load({
             value: st.text,
             rows: 3,
             disabled,
-            style: { width: '100%', boxSizing: 'border-box', resize: 'vertical' },
+            style: { width: '100%', boxSizing: 'border-box', resize: 'none' },
             onChange: (e) => { props.edit(field, e.target.value); },
           }),
           st.overridden ? jsx('button', {
@@ -531,6 +531,19 @@ window.__ModuleLoader__.load({
               inject: () => card.inject(),
             }, RouterConfigView))),
         'ui-auto-model-router: bundle config page',
+      );
+      ctx.effect(
+        () => ctx.configForms.whileServed([ENTRY_NS], () =>
+          ctx.slots.inject('plugins.row.config', () =>
+            ctx.slots.register({
+              name: 'plugins.row.config',
+              key: 'dsh-auto-model-router#auto-model-router',
+              order: 100,
+              label: () => t('title'),
+              locale: NS,
+              inject: () => card.inject(),
+            }, RouterConfigView))),
+        'ui-auto-model-router: row config page',
       );
     }
     exports.NS = NS;

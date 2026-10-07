@@ -159,4 +159,48 @@ await t('first-turn disabled -> no prompt, stays chat', async () => {
   });
 });
 
+// 7. v0.8.6 W1: ask 已派出答案未回 → 首轮只注解不真切（keepReason=first-turn-pending，不调 selectModel）
+await t('v0.8.6 W1: first-turn pending -> annotate-only (no switch)', async () => {
+  await withTmpLog(async (readLines) => {
+    // ask 永不 settle：模拟 IM 桥吞掉后悬挂
+    const m = makeCtxUQ({ askImpl: () => new Promise(() => {}) });
+    apply(m.ctx, { enableDynamicRanking: false });
+    await runStep(m.handlers, { text: '你好', sid: 'session-ft-w1-pending', turn: 1 });
+    await sleep(80);
+    assert.equal(m.askCount(), 1, 'ask must have been dispatched');
+    assert.equal(m.calls.length, 0, 'pending round must not call selectModel');
+    const lines = await readLines();
+    const d1 = lines.find((l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-ft-w1-pending');
+    assert.ok(d1, 'turn1 decision must exist');
+    assert.equal(d1.keepReason, 'first-turn-pending', 'pending round keepReason must be first-turn-pending');
+    assert.equal(d1.switched ?? null, null, 'pending round must not switch');
+  });
+});
+
+// 8. v0.8.6 T9b: probe + asked 双落盘（sessionReady 诊断二选一）；无 provider 时 settled 落盘
+await t('v0.8.6 T9b: probe/asked jsonl present + no-provider settled', async () => {
+  await withTmpLog(async (readLines) => {
+    const m = makeCtxUQ({ hasProvider: false });
+    apply(m.ctx, { enableDynamicRanking: false });
+    await runStep(m.handlers, { text: '今天天气怎么样', sid: 'session-ft-t9b-probe', turn: 1 });
+    await sleep(80);
+    const lines = await readLines();
+    const settled = lines.find((l) => l.tool === 'first-turn/prompt-settled' && l.sid === 'session-ft-t9b-probe');
+    assert.ok(settled, 'no-provider must log prompt-settled');
+    assert.equal(settled.reason, 'first-turn-no-provider');
+    // 有 provider 时 probe + asked 必须落盘
+    const m2 = makeCtxUQ({ askImpl: () => new Promise(() => {}) });
+    apply(m2.ctx, { enableDynamicRanking: false });
+    await runStep(m2.handlers, { text: '你好', sid: 'session-ft-t9b-asked', turn: 1 });
+    await sleep(80);
+    const lines2 = await readLines();
+    const probe = lines2.find((l) => l.tool === 'first-turn/probe' && l.sid === 'session-ft-t9b-asked');
+    assert.ok(probe, 'probe line must exist');
+    assert.ok('sessionReady' in probe, 'probe must carry sessionReady');
+    const asked = lines2.find((l) => l.tool === 'first-turn/prompt-asked' && l.sid === 'session-ft-t9b-asked');
+    assert.ok(asked, 'prompt-asked line must exist');
+    assert.ok(Number.isFinite(asked.timeoutMs), 'prompt-asked must carry timeoutMs');
+  });
+});
+
 console.log('first-turn tests done');

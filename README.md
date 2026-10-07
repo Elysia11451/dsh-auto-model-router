@@ -80,7 +80,7 @@ dsh plugin --profile web exec auto-model-router.selftest
 
 ## 已知限制
 
-- **IM 首轮弹窗待 v0.8.6**：QQ/微信新会话首轮弹窗未触发（IM 桥 session 绑定时机问题），降级为静默 chat + 次轮 keyword-upgrade 自然纠正；DSH 主界面已验证可弹。
+- **IM 首轮弹窗待 v0.8.7（已知限制）**：首轮 Chat/Work 弹窗目前仅在 DSH 主界面生效；IM 通道（QQ/微信/TG）暂不支持，因 DSH 框架层 ask_user_question 在非 Web 通道上的已知缺陷（Discussion #2544、#4708），后续版本修复。
 - **首轮手动选择被覆盖（ISSUE-W1）**：手选 work 档模型 + 首轮 route=chat 时，首轮默认 chat 真切会覆盖一次，弹窗选 Work 后可纠回。
 - **关键词覆盖不足（ISSUE-P3-1）**：`查一下当前目录`/`跑一下测试`/`调用工具试试` 3 条边界误判 chat 档，次轮可升 work。
 

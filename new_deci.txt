@@ -1,0 +1,80 @@
+  function ownedDefaultTarget() {
+    try {
+      const adm = getService(ctx, 'agentDefaultModel');
+      if (!adm || typeof adm.currentSelection !== 'function') return null;
+      const sel = adm.currentSelection();
+      const p = String(sel?.provider || '');
+      const m = String(sel?.model || '');
+      if (!p || !m) return null;
+      if (p === 'our-free-model') return null; // 免费池不是"自有默认"，交给回退链
+      return { provider: p, model: m, effort: sel?.effort || cfg.chatEffort || undefined };
+    } catch { return null; }
+  }
+
+  // chat 路由目标：cfg.chatModel 优先，留空回退自有默认，再回退免费池。
+  function chatTarget() {
+    try {
+      const rawChat = String(cfg.chatModel || '').trim();
+      if (!rawChat) {
+        const owned = ownedDefaultTarget();
+        if (owned) {
+          const now = Date.now();
+          if (now - chatFallbackWarnedAt > 10 * 60 * 1000) {
+            chatFallbackWarnedAt = now;
+            safeLog(ctx, 'info', `chatModel empty; chat route uses your owned API default ${owned.provider}/${owned.model}.`);
+          }
+          return { ...owned, source: 'owned-default' };
+        }
+        const ct = resolveChatTarget({
+          chatProvider: cfg.chatProvider,
+          chatModel: '',
+          workProvider: cfg.workProvider,
+          workModelFallback: cfg.workModelFallback,
+        });
+        const now = Date.now();
+        if (now - chatFallbackWarnedAt > 10 * 60 * 1000) {
+          chatFallbackWarnedAt = now;
+          safeLog(ctx, 'warn', `chatModel empty + no owned default; chat route falls back to ${ct.provider}/${ct.model} (set chatModel in plugin config or configure an owned API default).`);
+        }
+        return ct;
+      }
+      return resolveChatTarget({
+        chatProvider: cfg.chatProvider,
+        chatModel: rawChat,
+        workProvider: cfg.workProvider,
+        workModelFallback: cfg.workModelFallback,
+      });
+    } catch {
+      return { provider: cfg.chatProvider, model: cfg.chatModel, source: 'configured' };
+    }
+  }
+
+  // 把 route 变成具体 target 挂到 exec.autoModelRouter（annotate-only，不做任何切换）。
+  function annotateRoute(exec, route, modelOverride) {
+    try {
+      if (!exec) return;
+      const task = route && route.task;
+      let target = null;
+      if (route && route.mode === 'work' && route.workStyle === 'owned') {
+        const ct = chatTarget();
+        target = { provider: ct.provider, model: ct.model, effort: cfg.workEffortOwned || cfg.chatEffort, source: 'owned-work' };
+      } else if (route && route.mode === 'work') {
+        if (manualLock.on) {
+          target = { provider: manualLock.provider, model: manualLock.model, effort: cfg.workEffort, source: 'manual-lock' };
+        } else {
+          target = { provider: cfg.workProvider, model: modelOverride || currentWorkModel(), effort: cfg.workEffort, source: 'dynamic' };
+        }
+      } else {
+        const ct = chatTarget();
+        target = { provider: ct.provider, model: ct.model, effort: cfg.chatEffort, source: ct.source };
+      }
+      if (!target || !target.provider || !target.model) {
+        safeLog(ctx, 'warn', `route=${route && route.mode} target incomplete (${target && target.provider}/${target && target.model}); annotate-only, no switch.`);
+        exec.autoModelRouter = { route: route && route.mode, task, workStyle: route && route.workStyle, target: null, freeModelOk: flags.freeModelOk };
+        return;
+      }
+      exec.autoModelRouter = { route: route && route.mode, task, workStyle: route && route.workStyle, target, freeModelOk: flags.freeModelOk };
+    } catch { /* annotate 只是诊断面，失败不阻断 */ }
+  }
+
+  // 群聊降配额提示（按会话冷却 + 计数上限）。
