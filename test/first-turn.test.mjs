@@ -33,12 +33,15 @@ function makeCtxUQ({ askImpl = null, hasProvider = true } = {}) {
   return { ctx, handlers, calls, askCount: () => askCalls };
 }
 
-const runStep = (handlers, { text, sid, meta = { channel: 'qq' }, turn = 1 }) =>
+const runStep = (handlers, { text, sid, meta = {}, turn = 1 }) =>
   handlers['agent/pre-step']({
     agent: { session: sid, source: meta },
     turn, step: 1,
     messages: [{ role: 'user', content: [{ type: 'text', text }], source: { kind: 'user', rpcId: 'x-human-1' } }],
   }, async () => ({ kind: 'allow' }));
+// IM 通道专用（v0.8.6.1 起 IM 首轮走关键词同步定档，不经过 ask）
+const runStepIM = (handlers, { text, sid, turn = 1 }) =>
+  runStep(handlers, { text, sid, meta: { channel: 'qq' }, turn });
 
 const withTmpLog = async (fn) => {
   const fsP = await import('node:fs/promises');
@@ -200,6 +203,43 @@ await t('v0.8.6 issues NTR 2: probe/asked jsonl present + no-provider settled', 
     const asked = lines2.find((l) => l.tool === 'first-turn/prompt-asked' && l.sid === 'session-ft-t9b-asked');
     assert.ok(asked, 'prompt-asked line must exist');
     assert.ok(Number.isFinite(asked.timeoutMs), 'prompt-asked must carry timeoutMs');
+  });
+});
+
+// 9. v0.8.6.1-preview（底线降级）：IM 首轮干活词 → 默认 chat，不经过 ask（askCalls=0）
+await t('v0.8.6.1: IM first-turn keyword work -> default chat, no ask', async () => {
+  await withTmpLog(async (readLines) => {
+    const m = makeCtxUQ({ askImpl: () => new Promise(() => {}) });
+    apply(m.ctx, { enableDynamicRanking: false });
+    await runStepIM(m.handlers, { text: '帮我查一下日志', sid: 'session-ft-im-work', turn: 1 });
+    await sleep(80);
+    assert.equal(m.askCount(), 0, 'IM must not trigger ask');
+    const lines = await readLines();
+    const kw = lines.find((l) => l.tool === 'first-turn/im-keyword' && l.sid === 'session-ft-im-work');
+    assert.ok(kw, 'im-keyword line must exist');
+    assert.equal(kw.mode, 'chat');
+    assert.equal(kw.reason, 'first-turn-im-default-chat');
+    const d1 = lines.find((l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-ft-im-work');
+    assert.ok(d1, 'turn1 decision must exist');
+    assert.equal(d1.route, 'chat');
+  });
+});
+
+// 10. v0.8.6.1: IM 首轮闲聊 → 同步 chat，不经过 ask
+await t('v0.8.6.1: IM first-turn chat -> sync chat, no ask', async () => {
+  await withTmpLog(async (readLines) => {
+    const m = makeCtxUQ({ askImpl: () => new Promise(() => {}) });
+    apply(m.ctx, { enableDynamicRanking: false });
+    await runStepIM(m.handlers, { text: '今天天气怎么样', sid: 'session-ft-im-chat', turn: 1 });
+    await sleep(80);
+    assert.equal(m.askCount(), 0, 'IM must not trigger ask');
+    const lines = await readLines();
+    const kw = lines.find((l) => l.tool === 'first-turn/im-keyword' && l.sid === 'session-ft-im-chat');
+    assert.ok(kw, 'im-keyword line must exist');
+    assert.equal(kw.mode, 'chat');
+    const d1 = lines.find((l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-ft-im-chat');
+    assert.ok(d1, 'turn1 decision must exist');
+    assert.equal(d1.route, 'chat');
   });
 });
 

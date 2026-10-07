@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.8.6.1-preview (2026-10-07，底线降级版)
+
+### 变更
+- IM 新会话首轮不再派出 ask（`ctx.userQuestions.ask()` 在非 Web 通道永久挂起，Discussion #2544/#4708）：一律默认 chat（reason=`first-turn-im-default-chat`），不挂起、不 pending；第二轮 keyword-upgrade 自然纠正干活需求
+- main 路径保持 ask 弹窗不变；群聊/关闭开关语义不变
+
+### 测试
+- 142 用例全绿（router 46 / session-mode 7 / crash 49 / leaderboard 30 / first-turn 10），含新增 IM 默认 chat 双断言（干活词/闲聊各 1）
+
+### 已知问题
+- IM 首轮往返（消息问句 + 用户选档重提）二期再做：HTTP 投递探针已通（`{"sent":true}`，QQ 已收到），缺的是插件内 `dshIm.send(botId,targetId)` 投递口接线 + waterfall 改写验证
+- issues NTR 3/4 沿用 v0.8.6 口径（未动）
+
 ## v0.8.6 (2026-10-07)
 
 ### 修复

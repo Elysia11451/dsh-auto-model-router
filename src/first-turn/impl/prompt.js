@@ -38,8 +38,8 @@ import { createAskTimeout, askErrorReason } from './timing.js';
  *   其余一切路径（群默认/关闭/无 provider/同步失败）均为 false。
  */
 export function establishFirstTurnState(o, d) {
-  const { ctx, cfg, modeStore, getService, safeLog, isGroupMeta, appendRouteLog } = d;
-  const { sid, meta, agent } = o;
+  const { ctx, cfg, modeStore, getService, safeLog, isGroupMeta, appendRouteLog, classifyTask } = d;
+  const { sid, meta, agent, text = '', source = '' } = o;
   // 已有记录的 sid 直接跳过弹窗（老会话误弹修复：pre-step read  miss 后的二次保险）
   try {
     const existing = modeStore?.peek?.(sid);
@@ -64,6 +64,14 @@ export function establishFirstTurnState(o, d) {
   }
   if (cfg.firstTurnPrompt === false) {
     modeStore.set(sid, { mode: 'chat', chatTurns: 0, reason: 'first-turn-disabled' });
+    return { mode: 'chat', chatTurns: 0, firstTurnPending: false };
+  }
+  // v0.8.6.1-preview（底线降级）：IM 首轮跳过 ask，直接默认 chat。
+  // 纠正：HTTP 投递探针实测成功（{"sent":true}，QQ 已收到），不存在“无投递服务”；
+  // 本版为保发版时效放弃消息往返，不取 dshIm、不挂起、不 pending；第二轮 keyword-upgrade 自然纠正。main 保持 ask 不变。
+  if (source === 'im') {
+    modeStore.set(sid, { mode: 'chat', chatTurns: 0, reason: 'first-turn-im-default-chat' });
+    logJsonl({ sid, tool: 'first-turn/im-keyword', mode: 'chat', reason: 'first-turn-im-default-chat' });
     return { mode: 'chat', chatTurns: 0, firstTurnPending: false };
   }
   modeStore.set(sid, { mode: 'chat', chatTurns: 0, reason: 'first-turn-pending' });

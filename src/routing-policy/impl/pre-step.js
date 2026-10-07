@@ -123,7 +123,7 @@ export function createPreStepHandler(d) {
         const pending = hasPendingToolCalls(msgs);         // 任务进行中 → 冻结降档
         let st = await modeStore.read(sid);                // Map 优先，缺失读侧车（幂等 hydrate）
         if (!st) {
-          const fst = establishFirstTurnState({ sid, meta, agent }, firstTurnDeps);
+          const fst = establishFirstTurnState({ sid, meta, agent, text, source }, firstTurnDeps);
           st = fst;
           firstTurnPending = fst?.firstTurnPending === true;
         } else {

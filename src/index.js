@@ -18,7 +18,7 @@
  */
 import Schema from '@deepseek-ai/schemastery';
 // routing-policy：判定纯函数 + 状态机 + 领域实例
-import { isGroupMeta, sourceFromMeta } from './routing-policy/impl/classifier.js';
+import { isGroupMeta, sourceFromMeta, classifyTask } from './routing-policy/impl/classifier.js';
 import {
   DEFAULTS, normalizeEffortForSwitch, parseManualWorkLock, createDecider, decideRoute,
   resolveChatTarget, isColdStartCrossKind, isUnknownDrift, isSameKind, buildSelectModelPayload,
@@ -348,7 +348,7 @@ export function apply(ctx, config = {}) {
   const { readSelectionProjection, readSelectionForRoute, manualKeepReason, applyPriorityMode, shouldSwitch, realSwitch } = sw;
 
   // ── first-turn：首轮状态建立与弹窗（isGroupMeta 属 routing-policy，经 deps 注入）──
-  const firstTurnDeps = { ctx, cfg, modeStore, getService, safeLog, isGroupMeta, appendRouteLog };
+  const firstTurnDeps = { ctx, cfg, modeStore, getService, safeLog, isGroupMeta, classifyTask, appendRouteLog };
 
   // ── handlers：两条钩子主体 ──
   const preExecuteHandler = createPreExecuteHandler({
