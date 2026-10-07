@@ -10,7 +10,7 @@
 - 140 用例全绿（router 46 / session-mode 7 / crash 49 / leaderboard 30 / first-turn 8），含新增 issues NTR 1 annotate-only + issues NTR 2 probe/asked 落盘断言
 
 ### 已知问题
-- issues NTR 3: Chat 链头已从 GLM 改为 DeepSeek（GLM 额度已空）
+- issues NTR 3: 默认 Chat 链头调整为 DeepSeek，GLM 保留为备选
 - issues NTR 2 后续：IM 新会话首轮弹窗零触发的二选一诊断需生产 QQ 实测（看 probe 行 sessionReady + asked/settled 是否成对出现）
 - issues NTR 4: 关键词覆盖不足（3 条边界消息误判：查一下当前目录/跑一下测试/调用工具试试，本版未动）
 
@@ -29,7 +29,7 @@
 - 138 用例全绿（router 46 / session-mode 7 / crash 49 / leaderboard 30 / first-turn 6），含新增 chat-chain-empty 回退断言
 
 ### 已知问题
-- issues NTR 3: Chat 链头已从 GLM 改为 DeepSeek（GLM 额度已空）
+- issues NTR 3: 默认 Chat 链头调整为 DeepSeek，GLM 保留为备选
 - issues NTR 2: IM 通道首轮弹窗未触发，主界面正常，留待 v0.8.6
 - issues NTR 1: 首轮手动选择被覆盖（首轮默认 chat 真切覆盖手选 work 档模型，弹窗选 Work 后可纠回）
 - issues NTR 4: 关键词覆盖不足（3 条边界消息误判：查一下当前目录/跑一下测试/调用工具试试）
