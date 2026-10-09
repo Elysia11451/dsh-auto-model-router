@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import { classifyTask, sourceFromMeta, isGroupMeta } from '../src/routing-policy/impl/classifier.js';
-import { isSameKind, decideRoute, buildGroupHint, normalizeEffortForSwitch, buildSelectModelPayload, resolveChatTarget, parseManualWorkLock, isColdStartCrossKind, isUnknownDrift, isWorkModelRef, nextSessionMode, DEFAULTS } from '../src/routing-policy/impl/decider.js';
+import { isSameKind, decideRoute, buildGroupHint, normalizeEffortForSwitch, buildSelectModelPayload, resolveChatTarget, parseManualWorkLock, isColdStartCrossKind, isUnknownDrift, isWorkModelRef, nextSessionMode, DEFAULTS, createDecider } from '../src/routing-policy/impl/decider.js';
 import { DEFAULT_WORK_MODEL_PRIORITY } from '../src/leaderboard/leaderboard.js';
+import { createRealSwitch } from '../src/switch-controller/impl/real-switch.js';
+import { createBoundedMap, SESSION_MODE_CAP } from '../src/routing-policy/impl/session-mode.js';
+import { createCooldown, SWITCH_STATE_CAP } from '../src/switch-controller/impl/cooldown.js';
 
 const t = (name, fn) => { try { fn(); console.log(`ok - ${name}`); } catch (e) { console.error(`FAIL - ${name}: ${e.message}`); process.exitCode = 1; } };
 
@@ -58,12 +61,42 @@ t('group work always free-dynamic', () => {
   assert.equal(r.workStyle, 'free');
 });
 
-// 精确同类：provider/model 全等才算同类，不按全家判定
-t('isSameKind is exact, not family', () => {
-  assert.equal(isSameKind('our-free-model/muse-spark-1.3-contributor-free/deep', 'our-free-model', 'muse-spark-1.3-contributor-free'), true);
+// v0.8.7 千问审计 P0-1：同类判定升级为 (provider, model, effort) 三元组
+// - 目标 effort 缺失（3 参调用）→ 非同类（原固化的 true 已改为 false）
+// - effort 已知且相等 → 同类；effort 不等 → 非同类
+t('isSameKind is exact triple (provider, model, effort)', () => {
+  assert.equal(isSameKind('our-free-model/muse-spark-1.3-contributor-free/deep', 'our-free-model', 'muse-spark-1.3-contributor-free'), false);
   assert.equal(isSameKind('our-free-model/muse-spark-1.3-contributor-free/deep', 'our-free-model', 'space-bunny-x1.1-free'), false);
-  assert.equal(isSameKind('zai-coding-cn/glm-5.3-flash/light', 'zai-coding-cn', 'glm-5.3-flash'), true);
+  assert.equal(isSameKind('zai-coding-cn/glm-5.3-flash/light', 'zai-coding-cn', 'glm-5.3-flash'), false);
   assert.equal(isSameKind('zai-coding-cn/glm-5.4/light', 'zai-coding-cn', 'glm-5.3-flash'), false);
+  // effort 相等 → 同类
+  assert.equal(isSameKind('our-free-model/muse-spark-1.3-contributor-free/deep', 'our-free-model', 'muse-spark-1.3-contributor-free', 'deep'), true);
+  // effort 不等（同模型 light vs deep）→ 非同类
+  assert.equal(isSameKind('our-free-model/muse-spark-1.3-contributor-free/light', 'our-free-model', 'muse-spark-1.3-contributor-free', 'deep'), false);
+  // 归一化：max→deep、off→light 视为相等
+  assert.equal(isSameKind('prov/mod/max', 'prov', 'mod', 'deep'), true);
+  assert.equal(isSameKind('prov/mod/off', 'prov', 'mod', 'light'), true);
+  // 当前 effort 未知（'-'）→ 保守同类（避免无 effort 菜单模型反复真切）
+  assert.equal(isSameKind('prov/mod/-', 'prov', 'mod', 'deep'), true);
+});
+
+// v0.8.7 新增：chat 和 work 解析到同一模型但 effort 不同 → 断言触发切换
+t('same model different effort triggers switch', () => {
+  const noop = () => {};
+  const sw = createRealSwitch({
+    ctx: {}, cfg: {}, flags: {}, getService: noop, safeLog: noop,
+    lastSwitch: new Map(), cooldown: { switchState: new Map(), gate: () => false },
+    knownWorkPairs: () => [], currentWorkModel: () => 'mimo-v2.6-flash-free',
+    resolveChatTarget, isColdStartCrossKind, isUnknownDrift, isSameKind,
+    buildSelectModelPayload, DEFAULT_WORK_MODEL: 'mimo-v2.6-flash-free',
+  });
+  const target = { provider: 'our-free-model', model: 'muse-spark-1.3-contributor-free', effort: 'deep' };
+  // 同模型但当前是 light、目标 deep → 必须真切
+  assert.notEqual(sw.shouldSwitch('our-free-model/muse-spark-1.3-contributor-free/light', target), null);
+  // 同模型同 effort → 不切
+  assert.equal(sw.shouldSwitch('our-free-model/muse-spark-1.3-contributor-free/deep', target), null);
+  // 不同模型 → 切
+  assert.notEqual(sw.shouldSwitch('zai-coding-cn/glm-5.3-flash/light', target), null);
 });
 
 // 规则三：群聊+work -> hint；私聊不 hint
@@ -307,5 +340,118 @@ t('S10 阈值边界序列：work 连续 3 轮无工具无关键词恰好降档�
   s = nextSessionMode(s.mode, false, true, s.chatTurns);
   assert.deepEqual(s, { mode: 'work', chatTurns: 0 }, '关键词清零');
 });
+
+// v0.8.7 步骤9（千问审计 P2-9：无界 Map 淘汰）：三 Map 各塞 501 项，最旧淘汰、最新保留。
+// 策略 = FIFO + 写刷新（上限 500，同 SESSION_MODE_CAP 口径；读不提升，无需 LRU；
+// key 全是 string 且需 size 淘汰 ⇒ 不用 WeakMap）。
+t('v0.8.7 step9: lastSwitch BoundedMap 501 项淘汰最旧保留最新 + 写刷新', () => {
+  assert.equal(SESSION_MODE_CAP, 500, 'cap 口径 500');
+  const m = createBoundedMap();
+  for (let i = 0; i <= 500; i++) m.set(`sess-${i}`, `p/m-${i}`);
+  assert.equal(m.size, 500, '501 项后 size=500');
+  assert.equal(m.has('sess-0'), false, '最旧 sess-0 被淘汰');
+  assert.equal(m.has('sess-500'), true, '最新 sess-500 保留');
+  assert.equal(m.has('sess-1'), true, '次旧 sess-1 仍在');
+  // 写刷新：复写 sess-1 提到最新，再塞一项，sess-1 不被淘汰、sess-2 成为最旧被淘汰
+  m.set('sess-1', 'p/m-1-refresh');
+  m.set('sess-501', 'p/m-501');
+  assert.equal(m.size, 500, '写刷新后仍有界');
+  assert.equal(m.has('sess-1'), true, '被复写的活跃 sess-1 提到最新未被淘汰');
+  assert.equal(m.has('sess-2'), false, 'sess-2 成为最旧被淘汰');
+  assert.equal(m.has('sess-501'), true, '最新 sess-501 保留');
+});
+t('v0.8.7 step9: cooldown.switchState mark 501 项淘汰最旧保留最新 + 写刷新', () => {
+  assert.equal(SWITCH_STATE_CAP, 500, 'cap 口径 500');
+  const cd = createCooldown();
+  for (let i = 0; i <= 500; i++) cd.mark(`sess-${i}`, 1000 + i);
+  assert.equal(cd.switchState.size, 500, '501 项后 size=500');
+  assert.equal(cd.switchState.has('sess-0'), false, '最旧 sess-0 被淘汰');
+  assert.equal(cd.switchState.has('sess-500'), true, '最新 sess-500 保留');
+  // 写刷新：复写 sess-1 提到最新，再 mark 一项，sess-1 保留、sess-2 被淘汰
+  cd.mark('sess-1', 9999);
+  cd.mark('sess-501', 10000);
+  assert.equal(cd.switchState.size, 500, '写刷新后仍有界');
+  assert.equal(cd.switchState.has('sess-1'), true, '活跃 sess-1 未被淘汰');
+  assert.equal(cd.switchState.has('sess-2'), false, 'sess-2 成为最旧被淘汰');
+  assert.equal(cd.switchState.has('sess-501'), true, '最新 sess-501 保留');
+});
+t('v0.8.7 step9: hintState 经 maybeGroupHint 501 会话淘汰最旧保留最新', () => {
+  const hintState = createBoundedMap();
+  const lastSwitch = createBoundedMap();
+  const cfg = {
+    enableGroupHint: true, workModel: 'w-model', workProvider: 'w-prov',
+    hintCooldownMs: 10 * 60 * 1000, hintMaxCount: 20, workEffort: 'deep',
+  };
+  const dec = createDecider({
+    ctx: {}, cfg, flags: {}, manualLock: { on: false },
+    lastSwitch, hintState,
+    getService: () => null,
+    safeLog: () => {},
+    currentWorkModel: () => 'w-prov/w-model',
+    sidOf: (exec) => exec?.agent?.session ?? '',
+  });
+  for (let i = 0; i <= 500; i++) {
+    const sid = `gsess-${i}`;
+    lastSwitch.set(sid, 'w-prov/w-model/deep');
+    dec.maybeGroupHint({}, { agent: { session: sid }, meta: { chatType: 'group' } }, { mode: 'chat' });
+  }
+  assert.equal(hintState.size, 500, '501 会话后 size=500');
+  assert.equal(hintState.has('gsess-0'), false, '最旧 gsess-0 被淘汰');
+  assert.equal(hintState.has('gsess-500'), true, '最新 gsess-500 保留');
+  assert.equal(hintState.has('gsess-1'), true, '次旧 gsess-1 仍在');
+});
+
+// ── v0.8.7 步骤8（千问审计）：路由日志脱敏 / telemetry 开关 / 轮转（异步 fs 用例）──
+await (async () => {
+  const fs = await import('node:fs/promises');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const { createRouteLog } = await import('../src/telemetry/impl/route-log.js');
+  const at = async (name, fn) => { try { await fn(); console.log(`ok - ${name}`); } catch (e) { console.error(`FAIL - ${name}: ${e.message}`); process.exitCode = 1; } };
+  // 每用例独立 DSH_HOME（口径同 crash.test withTmpLog：finally 还原 env）。
+  const withHome = async (fn) => {
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), 'router-rlog-'));
+    const prev = process.env.DSH_HOME;
+    process.env.DSH_HOME = home;
+    try { await fn(home); }
+    finally { if (prev === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = prev; }
+  };
+  const logFile = (home) => path.join(home, 'logs', 'auto-router.jsonl');
+
+  await at('v0.8.7 step8: 用户消息截断 100 字符落盘，非文本字段原样', async () => {
+    await withHome(async (home) => {
+      const rl = createRouteLog();
+      await rl.appendRouteLog({ sid: 's1', extractText: 'x'.repeat(500), reason: 'y'.repeat(500) });
+      const j = JSON.parse((await fs.readFile(logFile(home), 'utf8')).trim());
+      assert.equal(j.extractText.length, 101, '100 字符 + 省略号');
+      assert.ok(j.extractText.endsWith('…'), '截断以省略号收尾');
+      assert.equal(j.reason.length, 101, 'reason 同样截断');
+      assert.equal(j.sid, 's1', '非白名单字段不截断');
+    });
+  });
+
+  await at('v0.8.7 step8: enableRouteLog 关（isEnabled=false）不落盘', async () => {
+    await withHome(async (home) => {
+      const rl = createRouteLog({ isEnabled: () => false });
+      await rl.appendRouteLog({ sid: 's2' });
+      let ok = true;
+      try { await fs.readFile(logFile(home)); ok = false; } catch { /* ENOENT = 期望 */ }
+      assert.ok(ok, '开关关闭时不应产生日志文件');
+    });
+  });
+
+  await at('v0.8.7 step8: 超 maxBytes 归档为 .1 单档（磁盘有界）', async () => {
+    await withHome(async (home) => {
+      const rl = createRouteLog({ maxBytes: () => 64 });
+      await rl.appendRouteLog({ sid: 'old-1', pad: 'z'.repeat(200) }); // 主文件超 64B
+      await rl.appendRouteLog({ sid: 'new' }); // 写前发现超限 → 旧行归档
+      const main = await fs.readFile(logFile(home), 'utf8');
+      assert.ok(main.includes('"new"'), '新行在主文件');
+      assert.ok(!main.includes('"old-1"'), '旧行已移出主文件');
+      const arch = await fs.readFile(logFile(home) + '.1', 'utf8');
+      assert.ok(arch.includes('"old-1"'), '旧行在 .1 归档');
+    });
+  });
+})();
 
 console.log('router tests done');

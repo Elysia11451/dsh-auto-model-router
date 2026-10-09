@@ -206,8 +206,9 @@ await t('v0.8.6 issues NTR 2: probe/asked jsonl present + no-provider settled', 
   });
 });
 
-// 9. v0.8.6.1-preview（底线降级）：IM 首轮干活词 → 默认 chat，不经过 ask（askCalls=0）
-await t('v0.8.6.1: IM first-turn keyword work -> default chat, no ask', async () => {
+// 9. v0.8.7 审计 P0-6：IM 首轮干活词 → 按关键词定 work 初始档，不经过 ask（askCalls=0）
+//    旧行为（v0.8.6.1 无条件 chat）已废：干活指令首轮被忽略，要等第二轮才纠回。
+await t('v0.8.7 P0-6: IM first-turn keyword work -> work mode, no ask', async () => {
   await withTmpLog(async (readLines) => {
     const m = makeCtxUQ({ askImpl: () => new Promise(() => {}) });
     apply(m.ctx, { enableDynamicRanking: false });
@@ -217,11 +218,26 @@ await t('v0.8.6.1: IM first-turn keyword work -> default chat, no ask', async ()
     const lines = await readLines();
     const kw = lines.find((l) => l.tool === 'first-turn/im-keyword' && l.sid === 'session-ft-im-work');
     assert.ok(kw, 'im-keyword line must exist');
-    assert.equal(kw.mode, 'chat');
-    assert.equal(kw.reason, 'first-turn-im-default-chat');
+    assert.equal(kw.mode, 'work', 'v0.8.7: IM first-turn keyword text must seed work mode');
+    assert.equal(kw.reason, 'first-turn-im-keyword-work');
     const d1 = lines.find((l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-ft-im-work');
     assert.ok(d1, 'turn1 decision must exist');
-    assert.equal(d1.route, 'chat');
+    assert.equal(d1.route, 'work');
+  });
+});
+
+// 10. v0.8.7 审计 P0-6 任务指定用例：IM 首轮「帮我写个脚本」→ 断言 mode=work
+await t('v0.8.7 P0-6: IM first-turn 帮我写个脚本 -> mode=work', async () => {
+  await withTmpLog(async (readLines) => {
+    const m = makeCtxUQ({ askImpl: () => new Promise(() => {}) });
+    apply(m.ctx, { enableDynamicRanking: false });
+    await runStepIM(m.handlers, { text: '帮我写个脚本', sid: 'session-ft-im-script', turn: 1 });
+    await sleep(80);
+    assert.equal(m.askCount(), 0, 'IM must not trigger ask');
+    const lines = await readLines();
+    const kw = lines.find((l) => l.tool === 'first-turn/im-keyword' && l.sid === 'session-ft-im-script');
+    assert.ok(kw, 'im-keyword line must exist');
+    assert.equal(kw.mode, 'work', 'task-specified: 帮我写个脚本 -> mode=work');
   });
 });
 

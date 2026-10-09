@@ -532,19 +532,6 @@ window.__ModuleLoader__.load({
             }, RouterConfigView))),
         'ui-auto-model-router: bundle config page',
       );
-      ctx.effect(
-        () => ctx.configForms.whileServed([ENTRY_NS], () =>
-          ctx.slots.inject('plugins.row.config', () =>
-            ctx.slots.register({
-              name: 'plugins.row.config',
-              key: 'dsh-auto-model-router#auto-model-router',
-              order: 100,
-              label: () => t('title'),
-              locale: NS,
-              inject: () => card.inject(),
-            }, RouterConfigView))),
-        'ui-auto-model-router: row config page',
-      );
     }
     exports.NS = NS;
     exports.ENTRY_NS = ENTRY_NS;

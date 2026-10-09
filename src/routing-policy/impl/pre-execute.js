@@ -20,6 +20,7 @@ import { decideRoute } from './decider.js';
  * @property {{peek: Function, set: Function, read: Function}} modeStore
  * @property {(sid: string) => any} peekSessionMode
  * @property {Map<string, string>} lastSwitch
+ * @property {(ctx: object, name: string) => any} [getService] —— 跨域（ctx 服务读取，work-tool 弹窗用）
  * @property {() => void} ensureFresh                    —— 跨域（leaderboard）
  * @property {Function} annotateRoute                    —— 域内实例（decider）
  * @property {Function} maybeGroupHint                   —— 域内实例（decider）
@@ -32,7 +33,7 @@ export function createPreExecuteHandler(d) {
   const {
     ctx, cfg, safeLog, sidOf, modeStore, peekSessionMode, lastSwitch,
     ensureFresh, annotateRoute, maybeGroupHint, routeBranch,
-    readSelectionProjection, appendRouteLog,
+    readSelectionProjection, appendRouteLog, getService,
   } = d;
 
   // pre-execute 主体（单独命名，便于自测探活）
@@ -77,8 +78,121 @@ export function createPreExecuteHandler(d) {
           if (isToolCall && execSid && execSid !== 'unknown') {
             // v0.7.2 修正（turn 计数）：升档不清零 chatTurns（避免同 turn 内多次工具调用反复清零）；
             // 只置 tool 标记，真正的清零由 pre-step 在下一轮真人消息时按 turn 结算。
+            // v0.8.7 initialMode 四件套：initialMode=chat 的会话永不自动升 Work —— 工具调用也不升档。
+            // v0.8.7 promptOnWorkTool：Chat 档遇到生产型工具只弹窗问一次（fire-and-forget，不阻塞工具链）；
+            //   同意 → 手动切 Work（reason=manual-switch-to-work-privacy-released，承诺翻为 work）；
+            //   拒绝/超时/失败 → 留 chat 且本会话不再问（workToolAsked=true 粘住，后续生产工具也不再自动升）。
             const cur = modeStore.peek(execSid);
-            modeStore.set(execSid, { mode: 'work', chatTurns: cur?.chatTurns ?? 0, reason: 'tool-call', tool: true });
+            const curMode = cur?.mode ?? 'chat';
+            let toolNameForPrompt = '';
+            try { toolNameForPrompt = String(exec?.name ?? exec?.tool ?? '').trim(); } catch { toolNameForPrompt = ''; }
+            // 生产型 = 会改东西的工具；read/grep/glob 只读仍走旧自动升（低风险，不打扰）。
+            const isProdTool = !!toolNameForPrompt && !/^(read|grep|glob)$/i.test(toolNameForPrompt);
+            const promptOn = cfg?.promptOnWorkTool !== false;
+            const alreadyAsked = cur?.workToolAsked === true;
+            const doAutoUpgrade = () => {
+              try {
+                const c2 = modeStore.peek(execSid);
+                modeStore.set(execSid, { mode: 'work', chatTurns: c2?.chatTurns ?? cur?.chatTurns ?? 0, reason: 'tool-call', tool: true });
+              } catch { /* noop */ }
+            };
+            if (curMode !== 'chat') {
+              doAutoUpgrade();
+            } else if (isProdTool && promptOn && !alreadyAsked) {
+              // 先看有没有弹窗通道：无通道（单测/离线）= 回落旧行为直接自动升，
+              // 且不消耗“只问一次”额度（workToolAsked 保持 false，后续有通道时仍可问）。
+              let svc = null;
+              try {
+                svc = (typeof getService === 'function') ? getService(ctx, 'userQuestions') : (ctx?.userQuestions ?? null);
+              } catch { svc = null; }
+              if (!svc || typeof svc.ask !== 'function') {
+                try { safeLog(ctx, 'info', `work-tool prompt skipped for session ${execSid} (reason=work-tool-no-provider; fallback auto-upgrade).`); } catch { /* noop */ }
+                doAutoUpgrade();
+              } else {
+                try {
+                  // 首问：同步落 asked 标记（只问一次的并发保险），本轮先记 tool=true 留 chat，等答案异步纠正。
+                  try {
+                    modeStore.set(execSid, { mode: 'chat', chatTurns: cur?.chatTurns ?? 0, reason: 'promptOnWorkTool-asked', tool: true, workToolAsked: true });
+                  } catch { /* noop */ }
+                  try { safeLog(ctx, 'info', `work-tool prompt asked for session ${execSid} (tool=${toolNameForPrompt}; timeout=${Number(cfg?.firstTurnPromptTimeoutMs) || 60000}ms).`); } catch { /* noop */ }
+                  try { appendRouteLog({ sid: execSid, tool: 'work-tool/prompt-asked', mode: 'chat', reason: 'promptOnWorkTool-asked', workTool: toolNameForPrompt }).catch(() => {}); } catch { /* noop */ }
+                  // fire-and-forget：绝不 await，工具链立即放行。
+                  const timeoutMs = (() => { const n = Number(cfg?.firstTurnPromptTimeoutMs); return Number.isFinite(n) && n > 0 ? n : 60000; })();
+                  let settled = false;
+                  const finishAccept = () => {
+                    if (settled) return; settled = true;
+                    try {
+                      // 用户同意 = 手动切 Work（隐私放行）：承诺翻为 work，后续正常升降档。
+                      modeStore.set(execSid, { mode: 'work', chatTurns: (modeStore.peek(execSid)?.chatTurns ?? 0), reason: 'manual-switch-to-work-privacy-released', tool: true, workToolAsked: true, initialMode: 'work' });
+                    } catch { /* noop */ }
+                    try { safeLog(ctx, 'info', `work-tool prompt answered for session ${execSid}: work (reason=manual-switch-to-work-privacy-released).`); } catch { /* noop */ }
+                    try { appendRouteLog({ sid: execSid, tool: 'work-tool/prompt-settled', mode: 'work', reason: 'manual-switch-to-work-privacy-released', settled: 'answered' }).catch(() => {}); } catch { /* noop */ }
+                  };
+                  const finishDecline = (reason) => {
+                    if (settled) return; settled = true;
+                    try {
+                      // 拒绝/超时/失败 = 留 chat，asked 已粘住，本会话不再问也不再自动升。
+                      const c3 = modeStore.peek(execSid);
+                      modeStore.set(execSid, { mode: 'chat', chatTurns: c3?.chatTurns ?? 0, reason, tool: true, workToolAsked: true });
+                    } catch { /* noop */ }
+                    try { safeLog(ctx, 'info', `work-tool prompt settled for session ${execSid}: chat (reason=${reason}).`); } catch { /* noop */ }
+                    try { appendRouteLog({ sid: execSid, tool: 'work-tool/prompt-settled', mode: 'chat', reason, settled: reason.includes('timeout') ? 'timeout' : 'declined' }).catch(() => {}); } catch { /* noop */ }
+                  };
+                  let selfTimer = null;
+                  try {
+                    selfTimer = setTimeout(() => finishDecline('work-tool-timeout'), timeoutMs + 1000);
+                    if (selfTimer && typeof selfTimer.unref === 'function') try { selfTimer.unref(); } catch { /* noop */ }
+                  } catch { /* noop */ }
+                  let ctl = null;
+                  try {
+                    ctl = new AbortController();
+                    setTimeout(() => { try { ctl.abort(); } catch { /* noop */ } }, timeoutMs);
+                    if (typeof ctl.signal === 'object') { /* signal 挂到请求上 */ }
+                  } catch { ctl = null; }
+                  const req = {
+                    questions: [{
+                      id: 'work-tool-switch',
+                      question: `检测到生产型工具调用（${toolNameForPrompt}），当前是 Chat 档（省钱模式），是否切换到 Work 档（能力模式）？`,
+                      header: '档位确认',
+                      options: [
+                        { label: 'Work 档（能力模式）', description: '切换到 Work 档干活，用免费池最强模型' },
+                        { label: 'Chat 档（省钱模式）', description: '留在 Chat 档，本会话不再询问' },
+                      ],
+                    }],
+                  };
+                  if (ctl?.signal) req.signal = ctl.signal;
+                  // live agent 优先：exec.agent 是 ToolExecution 形状时不一定是 live root，能带才带。
+                  try {
+                    const liveAgent = exec?.agent;
+                    if (liveAgent && typeof liveAgent === 'object' && (liveAgent.session && typeof liveAgent.session === 'object')) req.agent = liveAgent;
+                  } catch { /* agentless 降级 */ }
+                  Promise.resolve().then(() => svc.ask(req)).then((ans) => {
+                    try { if (selfTimer) clearTimeout(selfTimer); } catch { /* noop */ }
+                    if (settled) return;
+                    let selected = '';
+                    try { selected = ans?.answers?.[0]?.selected?.[0] ?? ans?.answers?.[0]?.answer ?? ''; } catch { selected = ''; }
+                    if (String(selected).includes('Work')) finishAccept();
+                    else finishDecline('work-tool-declined');
+                  }).catch(() => {
+                    try { if (selfTimer) clearTimeout(selfTimer); } catch { /* noop */ }
+                    if (!settled) finishDecline('work-tool-error');
+                  });
+                } catch {
+                  // 弹窗组装失败 = 回落自动升（不阻断、不丢工具信号）。
+                  try { doAutoUpgrade(); } catch { /* noop */ }
+                }
+              } // 有通道分支结束（无通道已在上方回落自动升，不耗只问一次额度）
+            } else if (isProdTool && promptOn && alreadyAsked) {
+              // 已问过（上次拒绝/超时）：留 chat，只记 tool 标记供 pre-step 结算，不再弹窗、不自动升。
+              try {
+                modeStore.set(execSid, { mode: 'chat', chatTurns: cur?.chatTurns ?? 0, reason: 'promptOnWorkTool-asked-once-keep', tool: true, workToolAsked: true });
+              } catch { /* noop */ }
+              try { safeLog(ctx, 'info', `pre-execute keep ${execSid} on chat (reason=promptOnWorkTool-asked-once-keep; tool=${toolNameForPrompt}).`); } catch { /* noop */ }
+            } else if (cur?.initialMode === 'chat') {
+              try { safeLog(ctx, 'info', `pre-execute keep ${execSid} on chat (reason=initial-mode-chat-keep; tool=${String(exec?.name ?? exec?.tool ?? '')}).`); } catch { /* noop */ }
+            } else {
+              modeStore.set(execSid, { mode: 'work', chatTurns: cur?.chatTurns ?? 0, reason: 'tool-call', tool: true });
+            }
           }
 
           let meta = {};

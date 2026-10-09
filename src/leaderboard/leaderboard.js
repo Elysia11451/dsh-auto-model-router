@@ -60,6 +60,36 @@ function matchesNorm(a, b) {
   return a === b || a.startsWith(b) || b.startsWith(a);
 }
 
+// v0.8.7 千问审计 P0-2：已知发行后缀白名单 —— 前缀匹配只对「同一模型的发行变体」成立，
+// 不能让 mimo-v2.6-flash 误命中清单里的 mimo-v2.6-flash-lite（lite 是另一个档位，非发行后缀）。
+const RELEASE_CHANNEL_WORDS = new Set([
+  'alpha', 'beta', 'rc', 'preview', 'pre', 'dev', 'exp', 'experimental',
+  'instruct', 'it', 'chat', 'sft', 'finetune', 'ft',
+]);
+
+// 判断归一化后前缀匹配后多出来的 token 是否为「已知发行后缀」。
+// 数字（构建号/日期/规格 0731、550b、a55b）与版本号（v2）天然算发行标记；
+// 其余必须命中发行通道词白名单，否则视为不同模型（如 lite）。
+function isKnownReleaseToken(tok) {
+  if (!tok) return false;
+  if (/^\d/.test(tok)) return true;      // 0731 / 550b / a55b
+  if (/^v\d+$/.test(tok)) return true;   // v2 / v10
+  return RELEASE_CHANNEL_WORDS.has(tok);
+}
+
+// 严格归一化对名：等值直接命中；前缀命中时，多出的部分必须全部是已知发行后缀 token。
+function matchesNormStrict(a, b) {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  let ext;
+  if (a.startsWith(b)) ext = a.slice(b.length);
+  else if (b.startsWith(a)) ext = b.slice(a.length);
+  else return false;
+  const tokens = ext.replace(/^\./, '').split('.').filter(Boolean);
+  if (tokens.length === 0) return true; // 纯前缀相等
+  return tokens.every(isKnownReleaseToken);
+}
+
 /**
  * OpenRouter 榜单 × 可用清单求交：交集按榜单名次排序，另报清单里没进榜的。
  * 名次 = 该模型在 order 中最小命中下标；两个清单模型命中同一下标时先到先得。
@@ -221,26 +251,31 @@ export async function saveRankCache(cachePath, ids) {
  * 按优先降级链挑 work 模型：链头优先，命中可用清单即返回；全不中回退 fallback。
  * 两级匹配统一走 normalizeId（配置写全名/裸名/带前缀都能对上清单里的 id）。
  *
+ * v0.8.7 千问审计 P0-2 两处收紧：
+ *   ① 命中时返回清单里的原 id（而非链上写法），保证 selectModel 拿到真实可用 id；
+ *   ② 前缀匹配走 matchesNormStrict —— 多出部分必须是已知发行后缀白名单，
+ *      避免 chain=['mimo-v2.6-flash'] 误命中 availableIds=['mimo-v2.6-flash-lite']。
+ *
  * @param {Object} p
  * @param {string[]|null} p.chain         Config.workModelPriority（有序）
  * @param {string[]|null} p.availableIds  our-free-model 当前可用清单（未就绪传 null/[]）
  * @param {string} [p.fallback]           workModelFallback（缺省 DEFAULT_WORK_MODEL）
- * @returns {string} 命中的模型 id（返回链上的原写法，供 selectModel 使用）
+ * @returns {string} 命中的模型 id（返回清单里的原 id，供 selectModel 使用）
  */
 export function pickWorkModelFromChain({ chain, availableIds, fallback = DEFAULT_WORK_MODEL } = {}) {
   try {
     const list = Array.isArray(chain) ? chain.filter((m) => typeof m === 'string' && m.trim().length > 0) : [];
     const fb = typeof fallback === 'string' && fallback.trim() ? fallback : DEFAULT_WORK_MODEL;
     if (list.length === 0) return fb;
-    const avail = Array.isArray(availableIds) ? availableIds : [];
+    const avail = Array.isArray(availableIds) ? availableIds.filter((m) => typeof m === 'string' && m.trim().length > 0) : [];
     // 清单未就绪或全不可用：不阻塞，直接回退（调用方已同步触发后台补拉）。
     if (avail.length === 0) return fb;
-    // 两级匹配：归一化后等值或一端为另一端前缀（与 rankIntersection 同一套 matchesNorm），
-    // 配置写全名/裸名/带前缀（如 deepseek-v4-flash ↔ 清单里的 deepseek-v4-flash-0731）都能对上。
-    const availNorms = avail.map((m) => normalizeId(m)).filter((m) => m.length > 0);
+    const availNorms = avail.map((m) => ({ orig: m.trim(), norm: normalizeId(m) })).filter((x) => x.norm.length > 0);
     for (const want of list) {
       const n = normalizeId(want);
-      if (n && availNorms.some((a) => matchesNorm(a, n))) return want.trim();
+      if (!n) continue;
+      const hit = availNorms.find((x) => matchesNormStrict(x.norm, n));
+      if (hit) return hit.orig; // 返回清单原 id（真实可用 id），而非链上写法
     }
     return fb;
   } catch {

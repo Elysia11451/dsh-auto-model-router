@@ -133,22 +133,50 @@ export function createPreStepHandler(d) {
           // ②无工具调用 → 关键词防抖（有 kw 清零）否则 chatTurns+1，>=3 降 chat。
           // pending（任务进行中）→ 冻结计数。观测型工具永不置 tool 标记（pre-execute 已排除）。
           const hadTool = st.tool === true;
-          // 先消费标记（无论哪条分支，标记只活一个 turn）
-          let next;
-          let why;
-          if (hadTool) {
-            // 有真实工具调用（上一 turn 的工具在本 turn 消费）：本 turn 即新 turn 的起点。
-            // 边界1：本轮又有关键词（新工作指令）→ 不计数，保持 work/0。
-            // 边界2：本轮稍后又有新工具调用 → pre-execute 会重新置 tool 标记，
-            //   下一轮重新消费，计数永不推进（持续干活不降档）。
-            // 无关键词：本轮就是第 1 轮闲聊，直接起计 chatTurns=1（省掉清零轮，多一轮的问题）。
-            if (kwHit) {
-              next = { mode: 'work', chatTurns: 0 };
+          // v0.8.7 initialMode 四件套：首轮选 Chat = 会话级承诺，永不自动升 Work。
+          // initialMode=chat 时工具调用/关键词都不升档（只消费 tool 标记，锁 chat/0）；
+          // initialMode=work 时走正常升降档（降 chat 后工具调用可升回 work）；null（未承诺）走正常。
+          const initialPromise = st.initialMode === 'chat' ? 'chat' : (st.initialMode === 'work' ? 'work' : null);
+          if (initialPromise === 'chat') {
+            if (hadTool || st.mode !== 'chat' || (st.chatTurns ?? 0) !== 0) {
+              modeStore.set(sid, {
+                mode: 'chat',
+                chatTurns: 0,
+                tool: false,
+                reason: 'initial-mode-chat-keep',
+              });
+              st = { mode: 'chat', chatTurns: 0, tool: false, initialMode: 'chat', workToolAsked: st.workToolAsked === true };
             } else {
-              next = { mode: 'work', chatTurns: 1 };
+              // 已是 chat/0 且有 tool 标记待消费时仍需清标记（set 保留 initialMode）
+              if (st.tool === true) {
+                modeStore.set(sid, { mode: 'chat', chatTurns: 0, tool: false, reason: 'initial-mode-chat-keep' });
+                st = { mode: 'chat', chatTurns: 0, tool: false, initialMode: 'chat', workToolAsked: st.workToolAsked === true };
+              }
             }
-            why = 'tool-call';
           } else {
+            // 先消费标记（无论哪条分支，标记只活一个 turn）
+            let next;
+            let why;
+            if (hadTool) {
+              // v0.8.7 promptOnWorkTool：已问过（拒绝/超时/待答）且当前仍是 chat → 只消费标记，保持 chat，
+              // 绝不自动升 work（只问一次 + 拒绝终局；待答期间也不抢跑，等异步答案纠正）。
+              if (st.workToolAsked === true && st.mode !== 'work') {
+                next = { mode: 'chat', chatTurns: st.chatTurns ?? 0 };
+                why = 'promptOnWorkTool-asked-once-keep';
+              } else {
+                // 有真实工具调用（上一 turn 的工具在本 turn 消费）：本 turn 即新 turn 的起点。
+                // 边界1：本轮又有关键词（新工作指令）→ 不计数，保持 work/0。
+                // 边界2：本轮稍后又有新工具调用 → pre-execute 会重新置 tool 标记，
+                //   下一轮重新消费，计数永不推进（持续干活不降档）。
+                // 无关键词：本轮就是第 1 轮闲聊，直接起计 chatTurns=1（省掉清零轮，多一轮的问题）。
+                if (kwHit) {
+                  next = { mode: 'work', chatTurns: 0 };
+                } else {
+                  next = { mode: 'work', chatTurns: 1 };
+                }
+                why = 'tool-call';
+              }
+            } else {
             const effKw = kwHit;
             next = nextSessionMode(st.mode, false, effKw, st.chatTurns, { pendingToolCalls: pending });
             why = next.mode !== st.mode ? (next.mode === 'work' ? 'keyword-upgrade' : 'idle-3-turns') : 'chat-turn-count';
@@ -160,8 +188,10 @@ export function createPreStepHandler(d) {
               tool: false,
               reason: why,
             });
-            st = { mode: next.mode, chatTurns: next.chatTurns, tool: false };
+            // set 未带 initialMode/workToolAsked 时沿用旧值；本地 st 同步携带，避免本轮内丢失承诺/只问一次标记
+            st = { mode: next.mode, chatTurns: next.chatTurns, tool: false, initialMode: st.initialMode ?? null, workToolAsked: st.workToolAsked === true };
           }
+          } // initialMode 非 chat：正常升降档分支结束
         }
         smTask = st.mode === 'work' ? 'agent-work' : 'chat';
       } catch { /* 状态机失败保守回 chat 关键词兜底（decideRoute 内 classifyTask） */ }

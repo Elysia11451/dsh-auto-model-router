@@ -23,7 +23,7 @@ import {
   DEFAULTS, normalizeEffortForSwitch, parseManualWorkLock, createDecider, decideRoute,
   resolveChatTarget, isColdStartCrossKind, isUnknownDrift, isSameKind, buildSelectModelPayload,
 } from './routing-policy/impl/decider.js';
-import { createSessionModeStore, MODE_CHANGED_EVENT } from './routing-policy/impl/session-mode.js';
+import { createSessionModeStore, MODE_CHANGED_EVENT, createBoundedMap } from './routing-policy/impl/session-mode.js';
 import { createPreExecuteHandler } from './routing-policy/impl/pre-execute.js';
 import { createPreStepHandler } from './routing-policy/impl/pre-step.js';
 // leaderboard：动态选模节拍
@@ -83,7 +83,7 @@ export const Config = Schema.object({
     .description({ zh: '仅自动模式生效。请填入你自己的 API 模型，格式 provider/model，按成本从低到高排序。留空则回退免费池并打警告', en: 'Only used in auto mode. Fill in your own API models as provider/model, cheapest first. Empty falls back to the free pool with a warning' }),
   // —— 分组 D · 群聊（默认折叠，高级）——
   enableGroupHint: Schema.boolean().default(false).volatile()
-    .description({ zh: '群聊工作模型提示。默认关（防打扰）；开后 work 档群聊发一次切换提示', en: 'Group work-model hint. Off by default to avoid noise' }),
+    .description({ zh: '群聊 work 档「诊断日志」开关（v0.8.7 P0-3）：只写一条诊断日志到路由日志，不向群聊发送任何消息。默认关；开后进入 work 档的群聊会话每冷却周期记一条日志', en: 'Group work-model diagnostic LOG switch (v0.8.7 P0-3): writes one diagnostic line to the route log only, sends no message to the group. Off by default' }),
   hintCooldownMs: Schema.number().default(300000).volatile()
     .description({ zh: '提示冷却（毫秒）。群聊提示发一次后多久内不再发', en: 'Hint cooldown in ms' }),
   // —— 分组 E · 状态机（默认折叠，高级）——
@@ -96,6 +96,13 @@ export const Config = Schema.object({
     .description({ zh: '首轮弹窗选择模式。开：新会话首条真人消息弹窗选 Chat/Work；关：默认 Chat 档不弹窗', en: 'First-turn mode prompt. On: ask Chat/Work on new session first message; off: default chat, no prompt' }),
   firstTurnPromptTimeoutMs: Schema.number().default(60000).volatile()
     .description({ zh: '首轮弹窗超时（毫秒）。超时回退默认 Chat 档', en: 'First-turn prompt timeout in ms; falls back to chat on timeout' }),
+  promptOnWorkTool: Schema.boolean().default(true).volatile()
+    .description({ zh: 'Chat 档遇到生产型工具（write/bash/edit）时，是否弹窗询问切换 Work 档。只问一次，拒绝后本会话不再问', en: 'When chat mode hits a production tool (write/bash/edit), ask whether to switch to work mode. Asked once per session; refusal is final for the session' }),
+  // —— 分组 G · 诊断日志（v0.8.7 步骤8）——
+  enableRouteLog: Schema.boolean().default(true).volatile()
+    .description({ zh: '路由诊断日志开关（auto-router.jsonl）。关：不落盘，只留控制台日志', en: 'Route diagnostic log switch (auto-router.jsonl). Off: nothing written to disk, console logs only' }),
+  routeLogMaxBytes: Schema.number().default(5242880).volatile()
+    .description({ zh: '路由日志轮转上限（字节，超限先归档为 .1 单档再写，磁盘占用有界）', en: 'Route log rotation cap in bytes (archived to a single .1 file when exceeded, bounded disk usage)' }),
   // —— 隐藏键（隔离自测专用，非 volatile + hidden，不进表单）——
   selftest: Schema.union([Schema.boolean(), Schema.string()]).default(false).hidden(true)
     .description({ zh: '隔离自测开关（仅隔离环境配置；生产不配置该键）', en: 'Isolation selftest switch (isolated env only; not set in production)' }),
@@ -111,6 +118,11 @@ export default { name, inject, Config, apply, SETTINGS_NAMESPACE };
 // selftest 门控（cfg.selftest）时捕获 safeLog 输出，供隔离验证断言；生产为 null 不生效。
 // 稳定容器：自测驱动（src/selftest/driver.js）写 capture.lines，safeLog 持续推入同一数组。
 const selftestCapture = { lines: null };
+
+// v0.8.7 步骤5：apply 后台预热链句柄（模块级单例，后 apply 覆盖前值）。
+// 测试：await warmup.promise 等预热跑完（替代固定 sleep）；warmup.cancel() 跳过剩余步。
+// 生产：无消费方，仅由 ctx.effect 卸载回调置 cancelled。
+export const warmup = { promise: Promise.resolve(), cancelled: false, cancel() { this.cancelled = true; } };
 
 // 真实 exec.agent.session 是 session 对象（不是字符串）：取其 id；字符串则直传。
 function sidOf(exec) {
@@ -205,6 +217,11 @@ export function apply(ctx, config = {}) {
     // F 首轮弹窗（v0.8.0）
     c.firstTurnPrompt = pick('firstTurnPrompt', true);
     c.firstTurnPromptTimeoutMs = pick('firstTurnPromptTimeoutMs', 60000);
+    // F2 Chat 档生产型工具询问（v0.8.7 设计变更：只问一次，拒绝后本会话不再问）
+    c.promptOnWorkTool = pick('promptOnWorkTool', true);
+    // G 诊断日志（v0.8.7 步骤8：开关 + 轮转上限）
+    c.enableRouteLog = pick('enableRouteLog', true);
+    c.routeLogMaxBytes = pick('routeLogMaxBytes', 5 * 1024 * 1024);
     // 隐藏自测键（plain，非 volatile）
     c.selftest = pick('selftest', false);
     c.selftestRound = pick('selftestRound', '');
@@ -227,6 +244,9 @@ export function apply(ctx, config = {}) {
     freeModelOk: true,
     // saveSelection 拦截是否生效（realSwitch 兜底写回读它）
     saveIntercepted: false,
+    // v0.8.7 步骤10（save-guard 收窄）：路由真切窗口深度。>0 = 窗口内，saveSelection
+    // 暂时 report-only；窗口外放行原写。real-switch withSaveWindow +1/-1（finally 配对）。
+    saveWindow: 0,
   };
   // ── 功能二（v0.5.1）：手动锁定 work 模型 ──
   // 锁成立 ⇒ work 目标 = 手动 pair，跳过动态排行榜（refreshLeaderboard/ensureFresh 直接 return，
@@ -270,7 +290,15 @@ export function apply(ctx, config = {}) {
   safeLog(ctx, 'info', `gates: enabled=${cfg.enabled} priority=${cfg.priorityMode} hint=${cfg.enableGroupHint} workMode=${cfg.workMode} chatMode=${cfg.chatMode} (reason=gates-initialized).`);
 
   // ── telemetry：JSONL 诊断落盘（auto-router.jsonl），失败静默 ──
-  const routeLog = createRouteLog();
+  // v0.8.7 步骤8：接线 Config 开关（enableRouteLog=false 直接不落盘）与轮转上限
+  // （routeLogMaxBytes，超限先归档为 .1 单档）。闭包读 cfg 稳定引用 → reloadCfg 即时生效。
+  const routeLog = createRouteLog({
+    isEnabled: () => cfg.enableRouteLog !== false,
+    maxBytes: () => {
+      const n = Number(cfg.routeLogMaxBytes);
+      return Number.isFinite(n) && n > 0 ? n : 5 * 1024 * 1024;
+    },
+  });
   const { getDshHomeDir, writeTextFile, appendRouteLog } = routeLog;
 
   // ── routing-policy：会话状态存储（热 Map + 冷侧车，升降档事件）──
@@ -283,24 +311,36 @@ export function apply(ctx, config = {}) {
   const peekSessionMode = (sid) => { try { return modeStore.peek(sid); } catch { return null; } };
 
   // 提示冷却（sessionKey -> { until, count }）与切换台账（sessionId -> 'provider/model/effort'）
-  const hintState = new Map();
-  const lastSwitch = new Map();
+  // v0.8.7 步骤9：两者换有界 Map（FIFO + 写刷新，上限 500，口径同 SESSION_MODE_CAP）。
+  const hintState = createBoundedMap();
+  const lastSwitch = createBoundedMap();
 
   // ── leaderboard：动态工作模型（联网排行榜，1h 缓存；同步读、后台刷，绝不阻塞工具链）──
+  // fetchImpl：v0.8.7 步骤5 测试注入通道（config.fetchImpl 为函数时直传榜单拉取；
+  //   生产 Config schema 不含该键 → 非测试环境恒 null = 走全局 fetch，行为零变化）。
+  const fetchImpl = typeof getRaw('fetchImpl') === 'function' ? getRaw('fetchImpl') : null;
   const leaderboard = createLeaderboardRefresh({
-    ctx, cfg, flags, manualLock, safeLog, getDshHomeDir,
+    ctx, cfg, flags, manualLock, safeLog, getDshHomeDir, fetchImpl,
     readTextFile: (p) => routeLog.readTextFile(p),
   });
   const { warmRankCache, refreshFreeList, refreshLeaderboard, lbStale, currentWorkModel, ensureFresh } = leaderboard;
 
   // 后台预热（apply 不 await）：先读文件缓存，再拉我方清单；榜单只在过期时打上游。
-  Promise.resolve()
-    .then(() => warmRankCache())
-    .then(() => modeStore.hydrate())
-    .then((n) => { if (n > 0) safeLog(ctx, 'info', 'session-mode sidecar loaded: ' + n + ' session(s).'); })
-    .then(() => refreshFreeList())
-    .then(() => { if (lbStale()) return refreshLeaderboard(); })
+  // v0.8.7 步骤5：warmup 句柄 —— 测试可 await promise 消除 sleep 竞态，可 cancel 跳过剩余步；
+  //   模块级单例（后 apply 覆盖前值）：测试 await 的永远是自己那次 apply 的链。
+  warmup.cancelled = false;
+  const guard = (fn) => () => (warmup.cancelled ? undefined : fn());
+  warmup.promise = Promise.resolve()
+    .then(guard(() => warmRankCache()))
+    .then(guard(() => modeStore.hydrate()))
+    .then((n) => { if (!warmup.cancelled && n > 0) safeLog(ctx, 'info', 'session-mode sidecar loaded: ' + n + ' session(s).'); })
+    .then(guard(() => refreshFreeList()))
+    .then(guard(() => { if (lbStale()) return refreshLeaderboard(); }))
     .catch(() => {});
+  // 卸载/热重载：置取消位，链在下一个 guard 点停步（已在途的单步跑完即止）。
+  try {
+    ctx.effect(() => () => { warmup.cancelled = true; }, 'dsh-auto-model-router.warmup-cancel');
+  } catch { /* 语义可选：句柄登记失败不影响路由 */ }
 
   // 依赖检查：our-free-model 缺失时输出明确错误并降级为纯日志模式，不静默失败。
   const degrade = (msg) => {
@@ -354,7 +394,7 @@ export function apply(ctx, config = {}) {
   const preExecuteHandler = createPreExecuteHandler({
     ctx, cfg, flags, safeLog, sidOf, modeStore, peekSessionMode, lastSwitch,
     ensureFresh, annotateRoute, maybeGroupHint, routeBranch,
-    readSelectionProjection, appendRouteLog,
+    readSelectionProjection, appendRouteLog, getService,
   });
   const preStepHandler = createPreStepHandler({
     ctx, cfg, flags, safeLog, sidOf, modeStore, peekSessionMode, lastSwitch,

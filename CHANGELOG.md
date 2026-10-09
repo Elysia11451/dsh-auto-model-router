@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.8.7 (2026-10-08)
+
+### 修复
+- 同类判定升级为 (provider, model, effort) 三元组：同模型不同 effort（chat=light vs work=deep）也会真切
+- pickWorkModelFromChain 命中返回清单真实 id，发行后缀白名单收紧（lite 不误命中）
+- 群聊提示只写诊断日志，不发群消息（Config/README 同步）
+- peerDependencies 移除 dsh-our-free-model，optional 加 @deepseek-ai/schemastery
+- warmup 句柄 + 每用例独立 DSH_HOME + fetchImpl 注入，根治 flaky
+- IM 首轮 ask 缺席/非 web 通道时用 classifyTask 定初始模式，不再无条件落 chat
+- refreshFreeList 仅取 state==='available' 的模型
+- lastSwitch / cooldown.switchState / hintState 全部 BoundedMap（cap500），长跑不爆内存
+- route-log 三键 + save-guard 收窄（同轮落地）
+
+### 新增
+- initialMode 四件套：session-mode 加 initialMode（set/hydrate 保留语义）；prompt `__finish` 仅 answered 写承诺；pre-step/pre-execute 升档前查承诺（chat 承诺永不升 work，work 承诺可升回）
+- promptOnWorkTool 只问一次：Chat 遇生产型工具（非 read/grep/glob）弹窗一次，fire-and-forget；同意切 work 并翻承诺，拒绝/超时/失败留 chat 并粘住不再问；无通道回落自动升且不耗额度
+
+### 测试
+- 153 用例全绿（router 53 / session-mode 7 / crash 51 / leaderboard 31 / first-turn 11），EXIT=0，7 轮零失败无 flake
+- IM 往返两轮时间盒止损：降级为「默认 chat + classifyTask 关键词纠正」，first-turn.test P0-6 覆盖初始档，端到端未验证
+
+### 已知问题
+- IM 消息往返（直投 + 选档重提）留后续版本：需用户在设置页提供 botId/targetId 后另起时间盒；或往 dev 装 dsh-im（需 pnpm add + 重启，另排期）
+- initialMode 承诺无独立用例（test/ 里 0 命中），promptOnWorkTool A/B 待转正式用例，留后续版本
+- 关键词覆盖不足：查一下当前目录/跑一下测试/调用工具试试 3 条边界仍误判 chat，次轮可升 work
+
 ## v0.8.6.1-preview (2026-10-07，底线降级版)
 
 ### 变更
