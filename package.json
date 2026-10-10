@@ -1,7 +1,9 @@
 {
   "name": "dsh-auto-model-router",
-  "version": "0.8.6.1-preview",
-  "description": "一个按会话来源自动切换模型与推理档位的 DSH 插件：IM 聊天走省 token 模型，Agent 工作走 our-free-model 最强模型最高档。",
+  "version": "0.8.7",
+  "description": "DSH 插件，自动路由 Chat/Work 模型，支持免费池降级",
+  "repository": "https://github.com/Elysia11451/dsh-auto-model-router",
+  "author": "Elysia11451",
   "license": "MIT",
   "type": "module",
   "main": "./src/index.js",
@@ -37,8 +39,10 @@
     "node": "^22.19.0 || >=24.0.0"
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh": ">=0.2.0-rc.1",
-    "dsh-our-free-model": ">=1.4.0"
+    "@deepseek-ai/dsh": ">=0.2.0-rc.1"
+  },
+  "optionalDependencies": {
+    "@deepseek-ai/schemastery": "^3.18.4"
   },
   "dsh": {
     "bundle": {

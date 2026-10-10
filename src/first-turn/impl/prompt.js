@@ -66,23 +66,31 @@ export function establishFirstTurnState(o, d) {
     modeStore.set(sid, { mode: 'chat', chatTurns: 0, reason: 'first-turn-disabled' });
     return { mode: 'chat', chatTurns: 0, firstTurnPending: false };
   }
-  // v0.8.6.1-preview（底线降级）：IM 首轮跳过 ask，直接默认 chat。
+  // v0.8.6.1-preview（底线降级）：IM 首轮跳过 ask，直接按关键词定初始档。
   // 纠正：HTTP 投递探针实测成功（{"sent":true}，QQ 已收到），不存在“无投递服务”；
-  // 本版为保发版时效放弃消息往返，不取 dshIm、不挂起、不 pending；第二轮 keyword-upgrade 自然纠正。main 保持 ask 不变。
+  // 本版为保发版时效放弃消息往返，不取 dshIm、不挂起、不 pending。
+  // v0.8.7 审计 P0-6：旧版无条件落 chat = IM 首轮忽略关键词（干活指令首条被判闲聊，
+  //   要等第二轮 keyword-upgrade 才纠回）→ 改用 classifyTask(text) 定初始模式；
+  //   第二轮 keyword-upgrade 语义不变（已 work 则不重复升）。群聊/关弹窗分支仍先于本分支（不变）。
   if (source === 'im') {
-    modeStore.set(sid, { mode: 'chat', chatTurns: 0, reason: 'first-turn-im-default-chat' });
-    logJsonl({ sid, tool: 'first-turn/im-keyword', mode: 'chat', reason: 'first-turn-im-default-chat' });
-    return { mode: 'chat', chatTurns: 0, firstTurnPending: false };
+    const imMode = (typeof classifyTask === 'function' && classifyTask(text) === 'agent-work') ? 'work' : 'chat';
+    const imReason = imMode === 'work' ? 'first-turn-im-keyword-work' : 'first-turn-im-default-chat';
+    modeStore.set(sid, { mode: imMode, chatTurns: 0, reason: imReason });
+    logJsonl({ sid, tool: 'first-turn/im-keyword', mode: imMode, reason: imReason });
+    return { mode: imMode, chatTurns: 0, firstTurnPending: false };
   }
   modeStore.set(sid, { mode: 'chat', chatTurns: 0, reason: 'first-turn-pending' });
   let asked = false; // ask 是否实际派出（issues NTR 1 pending 标记的唯一依据）
   try {
     const __svc = getService(ctx, 'userQuestions');
     if (!__svc || typeof __svc.ask !== 'function') {
-      modeStore.set(sid, { mode: 'chat', chatTurns: 0, reason: 'first-turn-no-provider' });
-      try { safeLog(ctx, 'info', `first-turn prompt skipped for session ${sid} (reason=first-turn-no-provider).`); } catch { /* noop */ }
-      logJsonl({ sid, tool: 'first-turn/prompt-settled', mode: 'chat', reason: 'first-turn-no-provider', settled: 'skipped', err: 'no-provider' });
-      return { mode: 'chat', chatTurns: 0, firstTurnPending: false };
+      // v0.8.7 审计 P0-6：ask provider 缺席（main 通道也弹不了窗）→ 同样用 classifyTask 定初始档，
+      //   不再无条件 chat（否则干活指令首轮被判闲聊，成本与轮次都浪费在错误档位）。
+      const npMode = (typeof classifyTask === 'function' && classifyTask(text) === 'agent-work') ? 'work' : 'chat';
+      modeStore.set(sid, { mode: npMode, chatTurns: 0, reason: 'first-turn-no-provider' });
+      try { safeLog(ctx, 'info', `first-turn prompt skipped for session ${sid} (reason=first-turn-no-provider; mode=${npMode}).`); } catch { /* noop */ }
+      logJsonl({ sid, tool: 'first-turn/prompt-settled', mode: npMode, reason: 'first-turn-no-provider', settled: 'skipped', err: 'no-provider' });
+      return { mode: npMode, chatTurns: 0, firstTurnPending: false };
     }
     // v0.8.6 issues NTR 2 探针：IM 桥 session 绑定就绪检查（#D 返回 null 透传是零触发主因之一）。
     // 只记录、不拦截：绑定未就绪也照常 ask（宿主 Web 端 waterfall 仍可能认领），诊断靠这一行二选一。
@@ -154,7 +162,34 @@ export function establishFirstTurnState(o, d) {
       __settled = true;
       try { __to.clear(); } catch { /* noop */ }
       try { if (__selfTimer) clearTimeout(__selfTimer); } catch { /* noop */ }
-      modeStore.set(sid, { mode, chatTurns: 0, reason });
+      // v0.8.7 initialMode 四件套：仅 answered 分支写 initialMode 承诺（首轮弹窗实答）。
+      // timeout / reject / 群聊 / IM / 无 provider 一律不写，保持旧行为测试绿；
+      // set 缺 initialMode 键时沿用旧值（新会话即 null），hydrate 同理保留。
+      const settledKind = extra?.settled;
+      if (settledKind === 'answered') {
+        modeStore.set(sid, { mode, chatTurns: 0, reason, initialMode: mode });
+      } else {
+        modeStore.set(sid, { mode, chatTurns: 0, reason });
+      }
+      // 1a 探针（只读诊断，不改状态、不调 selectModel）：dump 会话服务/回调上下文/modeStore。
+      try {
+        const __sessionsSvc = getService(ctx, 'sessions');
+        const __ctrl = getService(ctx, 'sessionController');
+        const __peek = (() => { try { return modeStore?.peek?.(sid) ?? null; } catch { return null; } })();
+        logJsonl({
+          sid, tool: 'first-turn/probe-1a',
+          sessionsSvcKeys: (() => { try { return Object.keys(__sessionsSvc ?? {}).slice(0, 20); } catch { return []; } })(),
+          sessionsHasSelectModel: !!(__sessionsSvc && typeof __sessionsSvc.selectModel === 'function'),
+          ctxSessionsKeys: (() => { try { return Object.keys(ctx?.sessions ?? {}).slice(0, 20); } catch { return []; } })(),
+          ctxSessionsHasSelectModel: !!(ctx?.sessions && typeof ctx.sessions.selectModel === 'function'),
+          controllerKeys: (() => { try { return Object.keys(__ctrl ?? {}).slice(0, 20); } catch { return []; } })(),
+          controllerHasSelectModel: !!(__ctrl && typeof __ctrl.selectModel === 'function'),
+          agentPresent: !!agent,
+          agentSession: (() => { try { const s = agent?.session; return typeof s === 'string' ? s : (s?.header?.id ?? s?.id ?? null); } catch { return null; } })(),
+          modeStorePeek: __peek ? { mode: __peek.mode ?? null, initialMode: __peek.initialMode ?? null, reason: __peek.reason ?? null } : null,
+          finishMode: mode, finishReason: reason, settledKind: settledKind ?? null, selected: extra?.selected ?? null,
+        });
+      } catch { /* 探针失败不阻断 */ }
       try { safeLog(ctx, level, msg); } catch { /* noop */ }
       logJsonl({ sid, tool: 'first-turn/prompt-settled', mode, reason, ...(extra || {}) });
     };

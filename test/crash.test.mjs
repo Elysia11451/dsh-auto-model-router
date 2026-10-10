@@ -1,5 +1,12 @@
 import assert from 'node:assert/strict';
-import { apply, name, inject } from '../src/index.js';
+import { apply as applyRaw, name, inject, warmup } from '../src/index.js';
+
+// ── v0.8.7 步骤5：确定性基建 ─────────────────────────────────────────────
+// 1) 默认离线 fetchImpl：warmup 后台链的榜单拉取不再打真实网络（本环境到
+//    openrouter 必超时 5s，链在途 = 后续用例 lb 状态漂移 = flake 源）。
+//    需要观测 fetch 的用例在 cfg 里自带 fetchImpl（spread 在后即覆盖）。
+const offlineFetch = async () => ({ ok: false, status: 503 });
+const apply = (ctx, cfg = {}) => applyRaw(ctx, { fetchImpl: offlineFetch, ...cfg });
 
 // 最小 ctx 仿真：复刻官方 auto-review 的 tools/pre-execute + effect 语义
 // 含 sessionController + agentDefaultModel：验证真切与污染回写
@@ -78,7 +85,37 @@ const waitLine = async (readLines, pred, timeoutMs = 3000) => {
   }
 };
 
-const t = async (n, fn) => { try { await fn(); console.log(`ok - ${n}`); } catch (e) { console.error(`FAIL - ${n}: ${e.message}`); process.exitCode = 1; } };
+// v0.8.7 步骤5：每用例独立 DSH_HOME —— 路由日志/文件缓存/清单互不串台
+// （旧版共享宿主 DSH_HOME：前用例后台链落盘会污染后用例 waitLine 读取 = flake 源）。
+// withTmpLog 内层再开自己的 home（套娃安全：内层 finally 恢复到本层值）。
+const t = async (n, fn) => {
+  const fsP = await import('node:fs/promises');
+  const osP = await import('node:os');
+  const pathP = await import('node:path');
+  const home = await fsP.mkdtemp(pathP.join(osP.tmpdir(), 'router-case-'));
+  const prevHome = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  try { await fn(); console.log(`ok - ${n}`); }
+  catch (e) { console.error(`FAIL - ${n}: ${e.message}`); process.exitCode = 1; }
+  finally {
+    if (prevHome === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = prevHome;
+    try { await fsP.rm(home, { recursive: true, force: true }); } catch { /* 残留无害 */ }
+  }
+};
+
+// v0.8.7 步骤5：预置会话模式到本用例隔离侧车（apply 前写，hydrate 首读即命中）。
+// 用途：锁/回退类用例需 work 会话——旧行为靠共享 DSH_HOME 残留记录蒙对，隔离后必须显式种子。
+const seedMode = async (sid, mode = 'work') => {
+  const fsP = await import('node:fs/promises');
+  const pathP = await import('node:path');
+  const dir = pathP.join(process.env.DSH_HOME, 'plugin-state');
+  await fsP.mkdir(dir, { recursive: true });
+  const file = pathP.join(dir, 'auto-model-router.session-modes.json');
+  let data = {};
+  try { data = JSON.parse(await fsP.readFile(file, 'utf8')); } catch { /* 无/损坏=空 */ }
+  data[sid] = { mode, chatTurns: 0, tool: false, updatedAt: Date.now() };
+  await fsP.writeFile(file, JSON.stringify(data, null, 2));
+};
 
 // 导出形态：具名 name/inject/apply（移动端强制 ['tools','llm']，多写即 PENDING）
 await t('named exports + inject', () => {
@@ -142,8 +179,9 @@ await t('real switch passes sessionId through with normalized effort', async () 
   assert.equal(calls[0].reasoningEffort, 'light');
 });
 
-// 污染拦截：apply 后 saveSelection 被替换为 report-only（真实写入 0 次）
-await t('saveSelection intercepted to report-only', async () => {
+// v0.8.7 步骤10（save-guard 收窄）：窗口外（默认）saveSelection 保持原始正常写 settings；
+// 守卫标记仍在位（窗口内才 report-only）。
+await t('save-guard narrow: outside window saveSelection passes through', async () => {
   const writes = [];
   const adm = {
     currentSelection() { return { provider: 'x', model: 'y' }; },
@@ -151,9 +189,29 @@ await t('saveSelection intercepted to report-only', async () => {
   };
   const { ctx } = makeCtx({ admImpl: adm });
   apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'] });
+  assert.equal(adm.__autoModelRouterGuard, true, 'guard marker must be installed');
   await adm.saveSelection({ provider: 'zai-coding-cn', model: 'glm-5.3-flash' });
-  assert.equal(writes.length, 0);
-  assert.equal(adm.__autoModelRouterGuard, true);
+  assert.equal(writes.length, 1, '窗口外放行：用户/默认路径正常写 settings');
+});
+
+// v0.8.7 步骤10：窗口内（路由真切 selectModel 期间）report-only，真切结束立即恢复放行。
+await t('v0.8.7 step10: save-guard windowed (suppress in realSwitch, restore outside)', async () => {
+  const writes = [];
+  const adm = {
+    currentSelection() { return { provider: 'our-free-model', model: 'muse-spark-1.3-contributor-free', reasoningEffort: 'deep' }; },
+    async saveSelection(next) { writes.push(next); },
+  };
+  // selectImpl 模拟宿主 session-controller.selectModel：真切时内部调 saveSelection
+  const { ctx, handlers } = makeCtx({
+    admImpl: adm,
+    selectImpl: async (p) => { await adm.saveSelection({ provider: p.provider, model: p.model }); return { selected: { ...p } }; },
+  });
+  apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'] });
+  await runStep(handlers, { text: 'hi', sid: 'session-w10' });
+  await new Promise((r) => setTimeout(r, 80));
+  assert.equal(writes.length, 0, '窗口内被抑制（真切不写全局默认）');
+  await adm.saveSelection({ provider: 'manual', model: 'user-pick' });
+  assert.equal(writes.length, 1, '窗口外恢复：手动选择正常写');
 });
 
 // 污染回写：拦截生效时真实写入 0 次（维持切前默认）
@@ -221,7 +279,7 @@ await t('exact same model kept, not re-switched', async () => {
     };
     ctx.sessions = { get: () => ({}) };
     apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'] });
-    const res = await runStep(handlers, { text: '帮我装插件', sid: 'session-manual', meta: {}, turn: 1 });
+    const res = await runStep(handlers, { text: '今天天气怎么样', sid: 'session-manual', meta: {}, turn: 1 }); // v0.8.7 P0-6：T1 改闲聊（首轮按文本定档后，干活文本会直接判 work）
     assert.equal(res?.kind, 'allow');
     await new Promise((r) => setTimeout(r, 50));
     await runStep(handlers, { text: '帮我装插件', sid: 'session-manual', meta: {}, turn: 2 });
@@ -245,7 +303,7 @@ await t('durable manual selection never overridden (cross-model)', async () => {
     ctx.sessionProjections = { stateOf: () => ({ lastUsed: null, pending: proj.pending }) };
     ctx.sessions = { get: () => ({}) };
     apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'], reclaimUnknownModel: false }); // v0.5.3：守关闭纠偏时的手动优先（默认开启时未知1.3会被纠偏）
-    const res = await runStep(handlers, { text: '帮我装插件', sid: 'session-crossmodel', meta: {}, turn: 1 });
+    const res = await runStep(handlers, { text: '今天天气怎么样', sid: 'session-crossmodel', meta: {}, turn: 1 }); // v0.8.7 P0-6：T1 改闲聊
     assert.equal(res?.kind, 'allow');
     await new Promise((r) => setTimeout(r, 50));
     // T1 落 chat 真切（lastSwitch 建立路由自有态），T2 恢复 durable 手动值再断言保持
@@ -272,7 +330,7 @@ await t('durable chat selection rerouted under work command when ledger empty (c
     };
     ctx.sessions = { get: () => ({}) };
     apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'] });
-    await runStep(handlers, { text: '帮我装插件', sid: 'session-cross', meta: {}, turn: 1 });
+    await runStep(handlers, { text: '今天天气怎么样', sid: 'session-cross', meta: {}, turn: 1 }); // v0.8.7 P0-6：T1 改闲聊
     await new Promise((r) => setTimeout(r, 50));
     assert.equal(calls.length, 0, 'T1 first-turn chat same-kind stays kept (no switch)');
     await runStep(handlers, { text: '帮我装插件', sid: 'session-cross', meta: {}, turn: 2 });
@@ -332,22 +390,20 @@ await t('chatModel prov/mod format splits into provider+model', async () => {
 });
 
 // enableDynamicRanking=false：全程 0 次 OpenRouter 请求，工作目标直接回退配置值
+// v0.8.7 步骤5：fetch 观测走 fetchImpl 注入（不再篡改全局 fetch——会被默认注入通道短路，
+// 且恢复时序竞态本身就是 flake 源）；预热等待改 await warmup.promise（替代固定 80ms sleep）。
 await t('enableDynamicRanking=false never fetches OpenRouter', async () => {
-  const origFetch = globalThis.fetch;
   const urls = [];
-  globalThis.fetch = async (url, ...rest) => { urls.push(String(url)); return origFetch(url, ...rest); };
-  try {
-    const { ctx, handlers, calls } = makeCtx();
-    apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'], enableDynamicRanking: false });
-    await new Promise((r) => setTimeout(r, 80)); // 等 apply 预热链跑完
-    await runStep(handlers, { text: '帮我装插件', sid: 'session-dynoff', meta: {} });
-    await new Promise((r) => setTimeout(r, 80)); // 等 ensureFresh 后台链跑完
-    assert.equal(urls.filter((u) => u.includes('openrouter.ai')).length, 0, `must not fetch OpenRouter, got: ${urls.join(', ')}`);
-    assert.equal(calls.length, 1);
-    assert.equal(calls[0].model, 'mimo-v2.6-flash-free'); // 回退配置值而非动态榜
-  } finally {
-    globalThis.fetch = origFetch;
-  }
+  const recordFetch = async (url) => { urls.push(String(url)); return { ok: false, status: 503 }; };
+  const { ctx, handlers, calls } = makeCtx();
+  await seedMode('session-dynoff'); // v0.8.7：work 会话显式种子（旧版靠共享侧车残留蒙对）
+  apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'], enableDynamicRanking: false, fetchImpl: recordFetch });
+  await warmup.promise; // 等 apply 预热链跑完（确定性，无 sleep 竞态）
+  await runStep(handlers, { text: '帮我装插件', sid: 'session-dynoff', meta: {} });
+  await new Promise((r) => setTimeout(r, 80)); // 等 ensureFresh 后台链跑完
+  assert.equal(urls.filter((u) => u.includes('openrouter.ai')).length, 0, `must not fetch OpenRouter, got: ${urls.join(', ')}`);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].model, 'mimo-v2.6-flash-free'); // 回退配置值而非动态榜
 });
 
 // ── v0.5.1 新增：手动绝对优先 + 手动锁 ──
@@ -397,7 +453,7 @@ await t('manual work-model lock forces manual target', async () => {
   apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'], manualWorkModelLocked: true, manualWorkModel: 'our-free-model/muse-spark-1.3-contributor-free' });
   await withTmpLog(async (readLines) => {
     // v0.8.0 两轮断言：T1 首轮默认 chat；T2 work 路由命中手动锁目标
-    await runStep(handlers, { text: '帮我装插件', sid: 'session-lockon', meta: {}, turn: 1 });
+    await runStep(handlers, { text: '今天天气怎么样', sid: 'session-lockon', meta: {}, turn: 1 }); // v0.8.7 P0-6：T1 改闲聊
     await new Promise((r) => setTimeout(r, 50));
     assert.equal(calls.length, 1, 'T1 first-turn chat switch expected');
     assert.equal(calls[0].provider, 'zai-coding-cn', 'T1 defaults to chat lane');
@@ -415,6 +471,7 @@ await t('manual work-model lock forces manual target', async () => {
 // 功能二：锁关（配了值也不生效）-> 走动态/回退
 await t('manual lock disabled falls back to dynamic/fallback', async () => {
   const { ctx, handlers, calls } = makeCtx();
+  await seedMode('session-lockoff'); // v0.8.7：work 会话显式种子（旧版靠共享侧车残留蒙对）
   apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'], manualWorkModelLocked: false, manualWorkModel: 'our-free-model/muse-spark-1.3-contributor-free' });
   await runStep(handlers, { text: '帮我装插件', sid: 'session-lockoff', meta: {} });
   await new Promise((r) => setTimeout(r, 50));
@@ -425,6 +482,7 @@ await t('manual lock disabled falls back to dynamic/fallback', async () => {
 // 功能二：锁开但值为空 -> 不构成锁（规格：manualWorkModel 默认空即回退动态）
 await t('lock enabled with empty manualWorkModel is inert', async () => {
   const { ctx, handlers, calls } = makeCtx();
+  await seedMode('session-lockempty'); // v0.8.7：work 会话显式种子（旧版靠共享侧车残留蒙对）
   apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'], manualWorkModelLocked: true, manualWorkModel: '' });
   await runStep(handlers, { text: '帮我装插件', sid: 'session-lockempty', meta: {} });
   await new Promise((r) => setTimeout(r, 50));
@@ -454,15 +512,51 @@ await t('static chain walks to second entry when head unavailable (v0.7.0 wiring
     // v0.8.0 两轮断言：T1 首轮默认 chat；T2 状态机已 work → 静态链解析到第二位
     // 清单加载是 apply 内 fire-and-forget：等它读完夹具文件
     await new Promise((r) => setTimeout(r, 300));
-    await runStep(handlers, { text: '帮我装插件', sid: 'session-chain-v070', meta: {}, turn: 1 });
+    await runStep(handlers, { text: '今天天气怎么样', sid: 'session-chain-v070', meta: {}, turn: 1 }); // v0.8.7 P0-6：T1 改闲聊
     await new Promise((r) => setTimeout(r, 50));
     await runStep(handlers, { text: '帮我装插件', sid: 'session-chain-v070', meta: {}, turn: 2 });
     await new Promise((r) => setTimeout(r, 50));
     assert.equal(calls.length, 2, 'T1 chat + T2 chain switch expected');
     assert.equal(calls[1].provider, 'our-free-model');
-    assert.equal(calls[1].model, 'glm-5.3-flash', 'head unavailable → chain entry #2, not single fallback');
+    // v0.8.7 P0-2：命中时返回清单里的原 id（glm-5.3-flash-free），而非链上写法
+    assert.equal(calls[1].model, 'glm-5.3-flash-free', 'head unavailable → chain entry #2 real id from list');
   } finally {
     if (prevHome === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = prevHome;
+  }
+});
+
+// v0.8.7 步骤7：availability.json 的 results 为数组时必须按 state==='available' 过滤——
+// 旧版直接给 [] 使 avail 回落整份 entries（判定短路：down 的模型照样被链选中）。
+await t('array-form availability filters down models (v0.8.7 step7)', async () => {
+  const fsP = await import('node:fs/promises');
+  const osP = await import('node:os');
+  const pathP = await import('node:path');
+  const home = await fsP.mkdtemp(pathP.join(osP.tmpdir(), 'router-avail-array-'));
+  await fsP.mkdir(pathP.join(home, 'our-free-model'), { recursive: true });
+  await fsP.writeFile(pathP.join(home, 'our-free-model', 'catalog.json'),
+    JSON.stringify({ entries: ['glm-5.3-flash-free', 'deepseek-v4-flash-free'] }));
+  // 数组形态：deepseek down、glm available → 旧版回落整份清单会选中 deepseek
+  await fsP.writeFile(pathP.join(home, 'our-free-model', 'availability.json'),
+    JSON.stringify({ results: [
+      { id: 'deepseek-v4-flash-free', state: 'down' },
+      { id: 'glm-5.3-flash-free', state: 'available' },
+    ] }));
+  const prevHome = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  try {
+    const { ctx, handlers, calls } = makeCtx();
+    await seedMode('session-avail-array');
+    apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'], enableDynamicRanking: false,
+      workModelPriority: ['deepseek-v4-flash-free', 'glm-5.3-flash'] });
+    await warmup.promise; // 预热链含 refreshFreeList：夹具读完才继续
+    await runStep(handlers, { text: '帮我装插件', sid: 'session-avail-array', meta: {} });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(calls.length, 1, 'work route must issue exactly one switch');
+    assert.equal(calls[0].model, 'glm-5.3-flash-free',
+      'down model must be filtered out of avail; chain must land on the available one');
+  } finally {
+    if (prevHome === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = prevHome;
+    try { await fsP.rm(home, { recursive: true, force: true }); } catch { /* noop */ }
   }
 });
 
@@ -544,7 +638,7 @@ await t('cold-start empty ledger reroutes work from chat lane (not kept)', async
   ctx.sessions = { get: () => ({}) };
   apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'] });
   await withTmpLog(async (readLines) => {
-    await runStep(handlers, { text: '帮我装插件', sid: 'session-cold-work', turn: 1 });
+    await runStep(handlers, { text: '今天天气怎么样', sid: 'session-cold-work', turn: 1 }); // v0.8.7 P0-6：T1 改闲聊
     await new Promise((r) => setTimeout(r, 50));
     assert.equal(calls.length, 0, 'T1 first-turn chat same-kind stays kept (no switch)');
     await runStep(handlers, { text: '帮我装插件', sid: 'session-cold-work', turn: 2 });
@@ -566,6 +660,7 @@ await t('cold-start same lane stays kept (not rerouted)', async () => {
     stateOf: () => ({ lastUsed: null, pending: { provider: 'our-free-model', model: 'muse-spark-1.2-contributor-free', reasoningEffort: 'deep' } }),
   };
   ctx.sessions = { get: () => ({}) };
+  await seedMode('session-cold-same'); // v0.8.7：work 会话显式种子（旧版靠共享侧车残留蒙对）
   apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'], reclaimUnknownModel: false });
   await runStep(handlers, { text: '帮我装插件', sid: 'session-cold-same' });
   await new Promise((r) => setTimeout(r, 50));
@@ -868,8 +963,8 @@ await t('v0.7.5 priorityMode=manual keeps manual selection', async () => {
   });
 });
 
-// 分支三：enableGroupHint=false（默认）不弹；true 弹一次，第二轮进冷却不再弹
-await t('v0.7.5 enableGroupHint gate: off = silent, on = hint once with cooldown', async () => {
+// 分支三（v0.8.7 P0-3 改为诊断日志语义）：enableGroupHint=false（默认）不写日志；true 写一条诊断日志，第二轮进冷却不再写
+await t('v0.7.5 enableGroupHint gate: off = silent, on = one diagnostic log with cooldown', async () => {
   const groupProj = () => ({
     stateOf: () => ({ lastUsed: null, pending: { provider: 'our-free-model', model: 'mimo-v2.6-flash-free', reasoningEffort: 'light' } }),
   });
@@ -883,7 +978,7 @@ await t('v0.7.5 enableGroupHint gate: off = silent, on = hint once with cooldown
     apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'], enableGroupHint: false, enableDynamicRanking: false });
     await runStep(handlers, { text: '哈哈哈', sid: 'session-hint-off', meta: { channel: 'qq', chatType: 'group' }, turn: 1 });
     await new Promise((r) => setTimeout(r, 50));
-    assert.equal(logs.filter((m) => m.includes('group hint for session')).length, 0, 'disabled hint must stay silent');
+    assert.equal(logs.filter((m) => m.includes('group hint diagnostic')).length, 0, 'disabled diagnostic log must stay silent');
   });
   // 开：第一轮弹 1 条，第二轮冷却内不再弹
   await withTmpLog(async () => {
@@ -893,13 +988,13 @@ await t('v0.7.5 enableGroupHint gate: off = silent, on = hint once with cooldown
     ctx.sessionProjections = groupProj();
     ctx.sessions = { get: () => ({}) };
     apply(ctx, { chatModelPriority: ['zai-coding-cn/glm-5.3-flash'], enableGroupHint: true, enableDynamicRanking: false });
-    const hintCount = () => logs.filter((m) => m.includes('group hint for session')).length;
+    const hintCount = () => logs.filter((m) => m.includes('group hint diagnostic')).length;
     await runStep(handlers, { text: '哈哈哈', sid: 'session-hint-on', meta: { channel: 'qq', chatType: 'group' }, turn: 1 });
     await new Promise((r) => setTimeout(r, 50));
-    assert.equal(hintCount(), 1, 'enabled hint must fire exactly once');
+    assert.equal(hintCount(), 1, 'enabled diagnostic log must fire exactly once');
     await runStep(handlers, { text: '在吗', sid: 'session-hint-on', meta: { channel: 'qq', chatType: 'group' }, turn: 2 });
     await new Promise((r) => setTimeout(r, 50));
-    assert.equal(hintCount(), 1, 'second round must be inside cooldown');
+    assert.equal(hintCount(), 1, 'second round must be inside diagnostic cooldown');
   });
 });
 

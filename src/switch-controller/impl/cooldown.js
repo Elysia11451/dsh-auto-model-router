@@ -13,12 +13,39 @@
  * @property {Map<string, number>} switchState
  * @property {number} SWITCH_COOLDOWN_MS
  * @property {(sid: string, opts: object) => ({blocked: boolean, bypass?: boolean})} gate
+ * @property {number} SWITCH_STATE_CAP —— 有界上限（v0.8.7 步骤9，与 SESSION_MODE_CAP 同口径 500）
+ * @property {(sid: string, ts: number) => void} mark —— 带淘汰的有界写入（替代裸 switchState.set）
  */
 
-export function createCooldown() {
+// v0.8.7 步骤9（千问审计 P2-9：无界 Map 淘汰）：与 session-mode SESSION_MODE_CAP 同口径。
+// FIFO + 写刷新：同 sid 复写提到最新，超限删最旧。读不提升（时间戳自带有效性，无需 LRU）。
+export const SWITCH_STATE_CAP = 500;
+
+function boundedSet(map, cap, k, v) {
+  try {
+    if (map.has(k)) map.delete(k);
+    map.set(k, v);
+    while (map.size > cap) {
+      const oldest = map.keys().next();
+      if (oldest.done) break;
+      map.delete(oldest.value);
+    }
+  } catch { try { map.set(k, v); } catch { /* noop */ } }
+}
+
+export function createCooldown({ cap = SWITCH_STATE_CAP } = {}) {
   // 真切节流：sessionId -> lastSwitchTs。
   const switchState = new Map();
   const SWITCH_COOLDOWN_MS = 60 * 1000; // 历史默认（现已被 cfg.switchCooldownMs 覆盖，默认 5000）
+
+  /**
+   * 有界写入：真切成功后记节流时间戳（替代裸 switchState.set，保证上限）。
+   * @param {string} sid
+   * @param {number} ts
+   */
+  function mark(sid, ts) {
+    boundedSet(switchState, cap, sid, ts);
+  }
 
   /**
    * 冷却闸门（逻辑自 realSwitch 原样搬移，含日志与返回语义）。
@@ -45,5 +72,5 @@ export function createCooldown() {
     return { blocked: false };
   }
 
-  return { switchState, SWITCH_COOLDOWN_MS, gate };
+  return { switchState, SWITCH_COOLDOWN_MS, SWITCH_STATE_CAP: cap, gate, mark };
 }

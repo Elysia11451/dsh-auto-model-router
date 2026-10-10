@@ -19,12 +19,41 @@
 
 // 有界：插入新 sid 前若 map 已达上限，按 Map 插入序清掉最旧一条。
 export const SESSION_MODE_CAP = 500;
+
+// v0.8.7 步骤9（千问审计 P2-9：无界 Map 淘汰）：与 SESSION_MODE_CAP 同口径（500）的
+// 有界 Map 工厂 —— 供装配根（index.js）的 lastSwitch / hintState 使用。
+// 策略 = FIFO + 写刷新：同 key 复写时先删再插（提到最新，防活跃会话被误淘汰）；
+// 超限删最旧（Map 插入序）。读不提升（点查 + 条目自带时间有效性，无需 LRU）。
+// key 全是 string（sessionId/sessionKey），需 size 淘汰 ⇒ 不用 WeakMap（对象 key 专用、无 size）。
+export class BoundedMap extends Map {
+  constructor(cap = SESSION_MODE_CAP) {
+    super();
+    this._cap = Number.isFinite(Number(cap)) && Number(cap) > 0 ? Math.trunc(Number(cap)) : SESSION_MODE_CAP;
+  }
+  set(k, v) {
+    try {
+      if (this.has(k)) super.delete(k);
+      super.set(k, v);
+      while (this.size > this._cap) {
+        const oldest = this.keys().next();
+        if (oldest.done) break;
+        super.delete(oldest.value);
+      }
+    } catch { try { super.set(k, v); } catch { /* noop */ } }
+    return this;
+  }
+}
+export function createBoundedMap(cap = SESSION_MODE_CAP) {
+  return new BoundedMap(cap);
+}
 // 侧车文件名（相对 $DSH_HOME/plugin-state/）。
 export const SESSION_MODE_SIDECAR = 'auto-model-router.session-modes.json';
 // 会话日志事件名（升/降档写一条轻量事件，供 UI 和事后核对）。
 export const MODE_CHANGED_EVENT = 'auto-model-router/mode-changed';
 
 const normMode = (m) => (m === 'work' ? 'work' : 'chat');
+const normInitialMode = (v) => (v === 'work' ? 'work' : (v === 'chat' ? 'chat' : null));
+const normWorkToolAsked = (v) => v === true;
 const normCount = (n) => {
   const x = Math.trunc(Number(n));
   return Number.isFinite(x) && x > 0 ? x : 0;
@@ -90,7 +119,7 @@ export function createSessionModeStore({ homeDir = null, onEvent = null } = {}) 
         const id = validSid(sid);
         if (!id || map.has(id) || !v || typeof v !== 'object') continue;
         if (v.mode !== 'chat' && v.mode !== 'work') continue;
-        map.set(id, { mode: v.mode, chatTurns: normCount(v.chatTurns), tool: normTool(v.tool), updatedAt: Number(v.updatedAt) || 0 });
+        map.set(id, { mode: v.mode, chatTurns: normCount(v.chatTurns), tool: normTool(v.tool), initialMode: normInitialMode(v.initialMode), workToolAsked: normWorkToolAsked(v.workToolAsked), updatedAt: Number(v.updatedAt) || 0 });
         added++;
       }
     } catch { /* 损坏=冷启动默认 */ }
@@ -132,7 +161,8 @@ export function createSessionModeStore({ homeDir = null, onEvent = null } = {}) 
       if (!id) return null;
       const o = (opts && typeof opts === 'object') ? opts : {};
       const prev = map.get(id) ?? null;
-      const entry = { mode: normMode(o.mode ?? 'chat'), chatTurns: normCount(o.chatTurns ?? 0), tool: (o && typeof o === 'object' && 'tool' in o) ? normTool(o.tool) : normTool(prev?.tool), updatedAt: Date.now() };
+      const hasInitial = o && typeof o === 'object' && 'initialMode' in o;
+      const entry = { mode: normMode(o.mode ?? 'chat'), chatTurns: normCount(o.chatTurns ?? 0), tool: (o && typeof o === 'object' && 'tool' in o) ? normTool(o.tool) : normTool(prev?.tool), initialMode: hasInitial ? normInitialMode(o.initialMode) : (prev?.initialMode === 'work' || prev?.initialMode === 'chat' ? prev.initialMode : null), workToolAsked: ('workToolAsked' in o) ? normWorkToolAsked(o.workToolAsked) : normWorkToolAsked(prev?.workToolAsked), updatedAt: Date.now() };
       const reason = o.reason ?? null;
       const prevMode = prev ? prev.mode : 'chat'; // 隐式默认 chat（冷启动语义）
       if (!map.has(id) && map.size >= SESSION_MODE_CAP) {

@@ -44,7 +44,7 @@ dsh plugin --profile web add github:Elysia11451/dsh-auto-model-router
 | `manualWorkModel / manualWorkModelLocked` | `"" / false` | 锁定 work 模型后跳过动态榜 |
 | `firstTurnPrompt / firstTurnPromptTimeoutMs` | `true / 60000` | 首轮弹窗开关与超时（超时回退 chat） |
 | `switchCooldownMs` | `5000` | 同会话切换冷却（升档直通，降档受限） |
-| `enableGroupHint / hintCooldownMs` | `false / 300000` | 群聊 work 提示开关与节流 |
+| `enableGroupHint / hintCooldownMs` | `false / 300000` | 群聊 work 档**诊断日志**开关与节流（v0.8.7 P0-3：只写日志，不发消息） |
 
 ```yaml
 - insert:
@@ -74,15 +74,17 @@ dsh plugin --profile web exec auto-model-router.selftest
 
 ## 验证
 
-- **已验（138 用例全绿）**：`npm test` = router 46 / session-mode 7 / crash 49 / leaderboard 30 / first-turn 6，`exit 0`（含新增 `chat-chain-empty` 回退断言）。
+- **已验（153 用例全绿）**：`npm test` = router 53 / session-mode 7 / crash 51 / leaderboard 31 / first-turn 11，`exit 0`（含新增 `chat-chain-empty` 回退断言）。
 - **离线（纯函数探针）**：`classifyTask/decideRoute/sourceFromMeta` 20 条判定 17/20 正确，3 条为关键词覆盖缺口（见已知限制），无逻辑缺陷。
 - **端到端（生产 profile web）**：冷启动后 DSH 存活、`dump-config` 条目 present、`link` 版本一致、QQ 新会话 `route=chat` 真切可查（`~/.dsh/logs/auto-router.jsonl`）。
 
 ## 已知限制
 
-- **IM 首轮弹窗待 v0.8.7（已知限制）**：首轮 Chat/Work 弹窗目前仅在 DSH 主界面生效；IM 通道（QQ/微信/TG）暂不支持，因 DSH 框架层 ask_user_question 在非 Web 通道上的已知缺陷（Discussion #2544、#4708），后续版本修复。
-- **首轮手动选择被覆盖（issues NTR 1）**：手选 work 档模型 + 首轮 route=chat 时，首轮默认 chat 真切会覆盖一次，弹窗选 Work 后可纠回。
-- **关键词覆盖不足（issues NTR 4）**：`查一下当前目录`/`跑一下测试`/`调用工具试试` 3 条边界误判 chat 档，次轮可升 work。
+- **IM 首轮弹窗已降级（v0.8.7 现状）**：首轮 Chat/Work 弹窗仅在 DSH 主界面生效；IM 通道（QQ/微信/TG）走「默认 chat + classifyTask 关键词纠正」（`first-turn-im-default-chat` / `first-turn-im-keyword-work`），因 DSH 框架层 ask_user_question 在非 Web 通道挂起（Discussion #2544、#4708）。消息往返（直投 + 选档重提）留给后续版本，需用户在设置页提供 botId/targetId 后另起时间盒。
+- **首轮承诺未经独立用例验证（v0.8.7 缺口）**：首轮 ask 已派出、答案未回时本轮只注解不真切（`first-turn-pending`），initialMode 承诺（首轮选 Chat 永不自动升 Work）已在 `pre-step.js` / `pre-execute.js` / `prompt.js` 落地；但 test/ 里 `initialMode` 0 命中，无独立断言，留后续版本补（promptOnWorkTool A/B 转正式用例）。
+- **关键词覆盖不足**：`查一下当前目录`/`跑一下测试`/`调用工具试试` 3 条边界误判 chat 档，次轮可升 work（分类器 `AGENT_KEYWORDS` 无此三条，本版未改）。
+- **推理档位三元组**：同类判定为 (provider, model, effort) 三元组，同模型不同 effort（chat=light vs work=deep）也会真切，属预期行为非 bug。
+- **可用性过滤**：动态榜仅取 `state==='available'` 的模型，不可用条目静默跳过；移动端未做真机窄屏专项验证，设置页 UI 以桌面为准。
 
 ## 依赖与致谢
 

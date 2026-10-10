@@ -167,7 +167,8 @@ t('chain walks in priority order skipping unavailable', () => {
     availableIds: ['deepseek-v4-flash-free', 'glm-5.3-flash-free'], // 头两个都不可用
     fallback: 'fb',
   });
-  assert.equal(got, 'glm-5.3-flash');
+  // v0.8.7 P0-2：命中返回清单原 id（glm-5.3-flash-free），而非链上写法 glm-5.3-flash
+  assert.equal(got, 'glm-5.3-flash-free');
 });
 
 t('chain falls back when nothing matches or list not ready', () => {
@@ -179,14 +180,14 @@ t('chain falls back when nothing matches or list not ready', () => {
   assert.equal(pickWorkModelFromChain({ chain: null, availableIds: null, fallback: 'fb' }), 'fb');
 });
 
-t('chain two-level normalize match with original spelling kept', () => {
-  // 带机构前缀的配置写法照样对上清单裸名，返回链上的原写法（供 selectModel 下发）
+t('chain two-level normalize match returns list real id (v0.8.7 P0-2)', () => {
+  // 带机构前缀的配置写法照样对上清单裸名；命中返回清单里的原 id（真实可用 id）
   const got = pickWorkModelFromChain({
     chain: ['z-ai/glm-5.3-flash', 'deepseek-v4-flash'],
     availableIds: ['glm-5.3-flash-free', 'deepseek-v4-flash-0731'],
     fallback: 'fb',
   });
-  assert.equal(got, 'z-ai/glm-5.3-flash', '返回链上原写法');
+  assert.equal(got, 'glm-5.3-flash-free', '返回清单原 id 而非链写法');
 });
 
 t('chain does not false-match deepseek-v4.1 vs v4', () => {
@@ -198,10 +199,20 @@ t('chain does not false-match deepseek-v4.1 vs v4', () => {
   assert.equal(got, 'fb');
   const got2 = pickWorkModelFromChain({
     chain: ['deepseek-v4-flash'],
-    availableIds: ['deepseek-v4-flash-0731'], // 前缀成立
+    availableIds: ['deepseek-v4-flash-0731'], // 前缀成立（0731 = 数字发行后缀，白名单内）
     fallback: 'fb',
   });
-  assert.equal(got2, 'deepseek-v4-flash');
+  assert.equal(got2, 'deepseek-v4-flash-0731', '返回清单原 id');
+});
+
+// v0.8.7 P0-2 新增：发行后缀白名单收紧 —— lite 是另一档位，不是发行后缀，不得误命中
+t('chain does not false-hit mimo-v2.6-flash against mimo-v2.6-flash-lite', () => {
+  const got = pickWorkModelFromChain({
+    chain: ['mimo-v2.6-flash'],
+    availableIds: ['mimo-v2.6-flash-lite'],
+    fallback: 'fb',
+  });
+  assert.equal(got, 'fb', '前缀命中但多出 token 非已知发行后缀 → 不得命中');
 });
 
 // ── v0.7.0 本地文件缓存（.cache/rankings.json）──

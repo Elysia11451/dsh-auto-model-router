@@ -153,10 +153,11 @@ export async function runLateChecks(d, E) {
           const exec4 = { args: '哈哈哈', agent: { session: sid4, source: { channel: 'qq', chatType: 'group' } } };
           const meta4 = { channel: 'qq', chatType: 'group' };
           const route4 = decideRoute({ source: 'im', text: '哈哈哈', meta: meta4, strategy: cfg.privateChatWorkStrategy });
-          const hintKey = `group hint for session ${sid4}`;
+          const hintKey = `group hint diagnostic (log only, not sent) for session ${sid4}`;
           const cnt = () => d.logLines.filter((l) => l.includes(hintKey)).length;
           // v0.7.5 Step4 分支三：断言随 enableGroupHint 门控走（不再块内强行打开）——
-          // 开 = 发一次 + 冷却内不再发；关（生产默认）= 全程静默。iso2 patch 配 true 验真机 ON 路径。
+          // v0.8.7 P0-3：maybeGroupHint 只写诊断日志（不发群消息）；开 = 记一次 + 冷却内不再记；
+          // 关（生产默认）= 全程静默。iso2 patch 配 true 验真机 ON 路径。
           const hintGateOn = cfg.enableGroupHint === true;
           const h0 = cnt();
           maybeGroupHint(ctx, exec4, route4);

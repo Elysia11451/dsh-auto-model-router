@@ -29,7 +29,7 @@ import {
  */
 
 export function createLeaderboardRefresh(d) {
-  const { ctx, cfg, flags, manualLock, safeLog, getDshHomeDir, readTextFile } = d;
+  const { ctx, cfg, flags, manualLock, safeLog, getDshHomeDir, readTextFile, fetchImpl = null } = d;
 
   // ── 动态工作模型（联网排行榜，1h 缓存；同步读、后台刷，绝不阻塞工具链）──
   // 数据源：OpenRouter ?sort=most-popular；交集 = our-free-model 当前可用清单。
@@ -66,9 +66,15 @@ export function createLeaderboardRefresh(d) {
       const results = JSON.parse(avRaw)?.results;
       if (Array.isArray(entries) && entries.length > 0) {
         freeList.ids = entries;
-        const ok = Array.isArray(results) ? [] : Object.entries(results || {})
-          .filter(([, v]) => v?.state === 'available').map(([k]) => k);
-        // 可用优先；上游全挂时退回整份清单（交集仍可能命中）
+        // v0.8.7 步骤7（千问审计）：results 为数组时按 state==='available' 过滤——
+        // 旧版直接给 []，使 avail 回落整份 entries，availability 判定被短路（下游拿全量当全可用）。
+        // 元素 id 取 id/model/key（夹具两形态都见过）；对象形态保持旧逻辑不变。
+        const ok = Array.isArray(results)
+          ? results.filter((r) => r?.state === 'available')
+              .map((r) => r?.id ?? r?.model ?? r?.key).filter(Boolean)
+          : Object.entries(results || {})
+              .filter(([, v]) => v?.state === 'available').map(([k]) => k);
+        // 可用优先；上游全挂/无一条可用时退回整份清单（交集仍可能命中）
         freeList.avail = ok.length > 0 ? ok : entries;
         freeList.at = Date.now();
       }
@@ -94,7 +100,8 @@ export function createLeaderboardRefresh(d) {
     if (!lb.begin()) return;
     lbFetchCount++; // 只统计真正发起的请求（guard/inflight 短路不计）
     try {
-      const ids = await fetchRankOrder({ url: OR_URL });
+      // v0.8.7 步骤5：fetchImpl 注入（单测离线确定性）；生产 null = 全局 fetch（行为零变化）。
+      const ids = await fetchRankOrder({ url: OR_URL, fetchImpl });
       if (ids) {
         lb.set(ids);
         safeLog(ctx, 'info', `leaderboard refreshed: ${ids.length} ranked models (ttl ${Math.round(rankTtlMs() / 60000)}min).`);

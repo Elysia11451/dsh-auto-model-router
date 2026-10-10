@@ -38,15 +38,27 @@ export function decideRoute({ source, text = '', meta = {}, currentMode = null, 
   return { mode: 'chat', task, needHint: needHintFallback, workStyle: 'owned' };
 }
 
-// 精确同类判定：cur 'provider/model' == target 'provider/model' 才算同类。
+// 精确同类判定：cur 'provider/model/effort' == target 'provider/model/effort' 才算同类（三元组全等）。
 // 不再按 provider 全家判定：手动 1.3 在位 + 动态最强空间兔 => 跨类，该换就换。
-export function isSameKind(curActualModel, targetProvider, targetModel) {
+// v0.8.7 千问审计 P0-1（reasoningEffort 切不动）：加入 effort 比较——
+//  - 目标 effort 缺失（调用方漏传）→ 严格判非同类（三元组不全不认同类）；
+//  - 当前 effort 读不出（'-' 或无段 = 宿主未报告）→ 保守判同类（无法验证不赌，
+//    防无 effort 菜单模型如 glm-5.3-flash 反复真切死循环）；
+//  - 双方 effort 已知 → 归一化（max→deep、off/minimal→light）后全等才同类。
+export function isSameKind(curActualModel, targetProvider, targetModel, targetEffort) {
   try {
     const cur = String(curActualModel || '').toLowerCase();
     const tp = String(targetProvider || '').toLowerCase();
     const tm = String(targetModel || '').toLowerCase();
     if (!cur || !tp || !tm) return false;
-    return cur.startsWith(`${tp}/${tm}`);
+    const prefix = `${tp}/${tm}`;
+    if (!cur.startsWith(prefix)) return false;
+    const rest = cur.slice(prefix.length);
+    const curEffort = rest.startsWith('/') ? rest.slice(1) : '';
+    const tEffort = normalizeEffortForSwitch(String(targetEffort ?? '').trim()) ?? '';
+    if (!tEffort) return false; // 目标无 effort → 非同类（强制走真切）
+    if (!curEffort || curEffort === '-') return true; // 当前 effort 未知 → 保守同类
+    return normalizeEffortForSwitch(curEffort) === tEffort;
   } catch { return false; }
 }
 
@@ -352,13 +364,13 @@ export function buildSelectModelPayload({ sessionId, provider, model, effort }) 
     } catch { /* 注解失败不影响放行 */ }
   }
 
-  // 规则三（看实际模型 + 防刷屏）：
+  // 规则三（看实际模型 + 防刷屏）—— v0.8.7 P0-3：本分支只产出「诊断日志」，不向群聊发消息。
   //  - 对症：只看 exec.agent.model 是否命中 work 档，不看文本分类
   //  - 防刷屏：hint_sent_until 冷却（默认 10min）+ hintMaxCount 计数（默认 20 条）双保险
   //  - 解除：切回非 work 模型 -> 清状态；群聊明确工作指令 -> 清状态（重新起算）
   function maybeGroupHint(ctxRef, exec, route) {
     try {
-      // v0.7.5 Step4 分支三：enableGroupHint=false（默认）⇒ 不弹群聊提示（早退，hintState 不动）。
+      // v0.7.5 Step4 分支三：enableGroupHint=false（默认）⇒ 不写诊断日志（早退，hintState 不动）。
       if (cfg?.enableGroupHint !== true) return;
       const meta = exec?.agent?.source || exec?.meta || {};
       const sessionKey = sidOf(exec) || 'unknown';
@@ -397,9 +409,17 @@ export function buildSelectModelPayload({ sessionId, provider, model, effort }) 
       const now = Date.now();
       if (st && now < st.until) return;
       if (st && st.count >= cfg.hintMaxCount) return;
-      // 提示 + 记录 hint_sent_until
+      // 提示 + 记录 hint_sent_until（v0.8.7 P0-3：仅诊断日志，不发送群消息）
+      // v0.8.7 步骤9：hintState 有界（FIFO 500；生产实例是 BoundedMap 时 set 自带淘汰，
+      // 外部注入裸 Map 时此处兜底删最旧，保证任何实例都不无界）。
       hintState.set(sessionKey, { until: now + cfg.hintCooldownMs, count: (st?.count || 0) + 1 });
-      safeLog(ctxRef, 'info', `group hint for session ${sessionKey}: ${buildGroupHint(currentWorkModel(), cfg.workEffort)}`);
+      try {
+        if (hintState.size > 500) {
+          const oldest = hintState.keys().next();
+          if (!oldest.done && oldest.value !== sessionKey) hintState.delete(oldest.value);
+        }
+      } catch { /* 淘汰失败不阻断 */ }
+      safeLog(ctxRef, 'info', `group hint diagnostic (log only, not sent) for session ${sessionKey}: ${buildGroupHint(currentWorkModel(), cfg.workEffort)}`);
     } catch { /* 提示失败不影响放行 */ }
   }
 

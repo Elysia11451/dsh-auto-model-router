@@ -38,6 +38,15 @@ export function createRealSwitch(d) {
   } = d;
   const { switchState, gate: cooldownGate } = cooldown;
 
+  // v0.8.7 步骤10（save-guard 收窄）：路由自己发起的 selectModel 期间开窗 ——
+  // 进窗 flags.saveWindow +1，出窗（含异常）-1；save-guard 仅在窗口深度 >0 时把
+  // saveSelection 变 report-only，窗口外用户手动选择照常写 settings。计数 + finally 配对，嵌套安全。
+  const withSaveWindow = async (fn) => {
+    flags.saveWindow = (Number(flags.saveWindow) || 0) + 1;
+    try { return await fn(); }
+    finally { flags.saveWindow = Math.max(0, (Number(flags.saveWindow) || 1) - 1); }
+  };
+
   // 同步版：pre-execute 热路径用（服务引用由调用方保证新鲜）。
   function readSelectionProjection(sid, services = null) {
     try {
@@ -189,10 +198,12 @@ export function createRealSwitch(d) {
   }
 
   // 仅当需要真切时返回目标，否则返回 null（表示：已在同类档位 / 用户选择优先，不干预）
+  // v0.8.7 千问审计 P0-1：同类判定升级为 (provider, model, effort) 三元组——
+  // 同模型不同 effort（chat=light vs work=deep）也必须真切，否则档位永远切不动。
   function shouldSwitch(actualSel, target) {
     try {
       if (!target?.provider || !target?.model) return target; // 目标无效交给调用方处理
-      if (isSameKind(actualSel, target.provider, target.model)) return null; // 精确同类才不覆盖
+      if (isSameKind(actualSel, target.provider, target.model, target.effort)) return null; // 三元组全等才不覆盖
       return target;
     } catch { return target; }
   }
@@ -270,8 +281,19 @@ export function createRealSwitch(d) {
       effort: target.effort,
     });
     try {
-      const res = await controller.selectModel(payload);
-      try { switchState.set(sid, Date.now()); lastSwitch.set(sid, `${payload.provider}/${payload.model}/${payload.reasoningEffort ?? '-'}`); } catch { /* noop */ }
+      const res = await withSaveWindow(() => controller.selectModel(payload));
+      // v0.8.7 步骤9：两处写入走有界口径 —— switchState 经 cooldown.mark（FIFO 500），
+      // lastSwitch 直接 set 时同样做 FIFO 淘汰（其实例是 BoundedMap 时 set 自带淘汰；
+      // 外部注入裸 Map（如单测/旧装配）时此处兜底删最旧，保证任何 Map 实例都不无界）。
+      try {
+        if (typeof cooldown?.mark === 'function') cooldown.mark(sid, Date.now());
+        else switchState.set(sid, Date.now());
+        lastSwitch.set(sid, `${payload.provider}/${payload.model}/${payload.reasoningEffort ?? '-'}`);
+        if (lastSwitch.size > 500) {
+          const oldest = lastSwitch.keys().next();
+          if (!oldest.done) lastSwitch.delete(oldest.value);
+        }
+      } catch { /* noop */ }
       // 兜底写回：仅当 saveSelection 拦截未生效时才需要（拦截生效时 save 已是 report-only）。
       // 用 __autoModelRouterGuard 标记区分，避免拦截后又调被替换的空函数。
       try {
@@ -302,8 +324,17 @@ export function createRealSwitch(d) {
       if (payload.reasoningEffort && /model-unavailable|effort/i.test(String(code))) {
         try {
           const retry = { sessionId: sid, provider: payload.provider, model: payload.model };
-          const res2 = await controller.selectModel(retry);
-          try { switchState.set(sid, Date.now()); lastSwitch.set(sid, `${retry.provider}/${retry.model}/-`); } catch { /* noop */ }
+          const res2 = await withSaveWindow(() => controller.selectModel(retry));
+          // v0.8.7 步骤9：同上有界口径（主路径注释见上）。
+          try {
+            if (typeof cooldown?.mark === 'function') cooldown.mark(sid, Date.now());
+            else switchState.set(sid, Date.now());
+            lastSwitch.set(sid, `${retry.provider}/${retry.model}/-`);
+            if (lastSwitch.size > 500) {
+              const oldest = lastSwitch.keys().next();
+              if (!oldest.done) lastSwitch.delete(oldest.value);
+            }
+          } catch { /* noop */ }
           try {
             if (!flags.saveIntercepted) {
               const adm = await resolveService('agentDefaultModel');
