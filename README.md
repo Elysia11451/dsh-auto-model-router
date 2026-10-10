@@ -1,12 +1,21 @@
 # dsh-auto-model-router
 
-一个按会话来源自动切换模型与推理档位的 DSH 插件：IM 闲聊走便宜的 Chat 档省 token，Agent 干活走免费池最强的 Work 档 deep 推理。
+> DSH 插件：按会话自动切换 Chat / Work 两个档位。闲聊用便宜的 Chat 档省 token，干活用免费池最强的 Work 档 deep 推理。
 
-- **双档路由**：IM 闲聊 → Chat 档（light）；主界面直用 / IM 明确干活 → Work 档（deep）。
-- **三层判定**：会话状态机 → 关键词兜底 → 默认 chat，关键词不反向覆盖状态机。
-- **首轮弹窗**：新会话首轮弹 Chat/Work 选择（DSH 主界面已验证）。
-- **方向性冷却**：chat→work 升档直通，降档受 `switchCooldownMs` 约束。
-- **手动绝对优先**：用户 durable 选择非本路由来源时一律不覆盖，只注解 `kept`。
+## 产品理念
+
+平时闲聊和干活对模型的要求完全不同：闲聊要便宜、快；干活要强、能深度推理。手动换模型又麻烦又容易忘，切错了要么浪费钱、要么干不好活。
+
+这个插件就是帮你自动分流：你只管说话，它按会话判断该走哪个档。只做路由注解，不改工具参数、不打断干活；你手动选过的模型，它一律让路不覆盖。
+
+## 实际功能（v0.8.7 预发行版，已验证）
+
+- **双档路由**：IM 闲聊 → Chat 档（light，自填便宜模型）；主界面直用 / IM 明确干活（装插件/跑命令/写代码） → Work 档（deep，免费池最强）。
+- **三层判定**：会话状态机 → 关键词兜底 → 默认 chat。状态机一旦记住你是干活还是闲聊，关键词不再反向覆盖；连 3 轮闲聊才从 work 降回 chat。
+- **首轮弹窗（仅 DSH 主界面）**：新会话首轮弹 Chat/Work 选择；选 Chat 承诺本会话永不自动升 Work，选 Work 可再降回。IM 通道（QQ/微信/TG）弹不出窗，见限制 NTR 5。
+- **方向性冷却**：chat→work 升档直通不等待；work→chat 降档受 `switchCooldownMs`（默认 5s）约束，防来回横跳。
+- **手动绝对优先**：会话里你亲手选过的模型（durable 选择），路由一律不覆盖，只注解 `kept`。
+- **Chat 档干活只问一次**：Chat 会话里调到生产型工具（写文件/跑命令，非 read/grep/glob）弹窗问一次：同意切 work 并翻承诺，拒绝/超时则本会话粘住 chat 不再问。
 
 ## 工作原理
 
@@ -78,13 +87,16 @@ dsh plugin --profile web exec auto-model-router.selftest
 - **离线（纯函数探针）**：`classifyTask/decideRoute/sourceFromMeta` 20 条判定 17/20 正确，3 条为关键词覆盖缺口（见已知限制），无逻辑缺陷。
 - **端到端（生产 profile web）**：冷启动后 DSH 存活、`dump-config` 条目 present、`link` 版本一致、QQ 新会话 `route=chat` 真切可查（`~/.dsh/logs/auto-router.jsonl`）。
 
-## 已知限制
+## 已知限制（v0.8.7 预发行版，用前必读）
 
-- **IM 首轮弹窗已降级（NTR 5，已知限制）**：首轮 Chat/Work 弹窗仅在 DSH 主界面生效；IM 通道（QQ/微信/TG）走「默认 chat + classifyTask 关键词纠正」（`first-turn-im-default-chat` / `first-turn-im-keyword-work`），因 DSH 框架层 ask_user_question 在非 Web 通道挂起（Discussion #2544、#4708）。消息往返（直投 + 选档重提）留给后续版本，需用户在设置页提供 botId/targetId 后另起时间盒。
-- **首轮承诺未经独立用例验证（NTR 6，已知限制）**：首轮 ask 已派出、答案未回时本轮只注解不真切（`first-turn-pending`，NTR 1 已修复行为），initialMode 承诺（首轮选 Chat 永不自动升 Work）已在 `pre-step.js` / `pre-execute.js` / `prompt.js` 落地；但 test/ 里 `initialMode` 0 命中，无独立断言，留后续版本补（promptOnWorkTool A/B 转正式用例）。
-- **关键词覆盖不足（NTR 4，已知限制，沿用 v0.8.6 口径）**：`查一下当前目录`/`跑一下测试`/`调用工具试试` 3 条边界误判 chat 档，次轮可升 work（分类器 `AGENT_KEYWORDS` 无此三条，本版未改）。
-- **推理档位三元组**：同类判定为 (provider, model, effort) 三元组，同模型不同 effort（chat=light vs work=deep）也会真切，属预期行为非 bug。
-- **可用性过滤**：动态榜仅取 `state==='available'` 的模型，不可用条目静默跳过；移动端未做真机窄屏专项验证，设置页 UI 以桌面为准。
+- **IM 首轮弹窗未触发**：现状——QQ/微信新会话首轮弹不出 Chat/Work 选择窗，降级为静默 chat，次轮靠关键词纠正。影响——IM 新用户首轮一定走 Chat 档，干活需求次轮才升 Work。计划——IM 往返整体留后续版本。
+- **首轮选 Chat 不立即切换**：现状——新会话选 Chat 后，第一轮模型仍继承 Work 档模型（`first-turn-pending` 分支在真切前短路）。影响——首轮答案仍由 Work 模型回答，发第二条消息才纠正。计划——v0.9.0 主打修复（settle 后追加主动 realSwitch）。
+- **Work 档手选 Chat 档 API 模型被覆盖**：现状——Work 会话里手动指定 Chat 档 API 模型会被路由强制覆盖。影响——想省钱手切便宜模型会被盖回去。计划——尚未诊断，待排查。
+- **首轮承诺无独立测试用例**：现状——initialMode 承诺机制（首轮选 Chat 永不自动升 Work）无独立断言覆盖，只靠集成测试。影响——改动首轮逻辑时可能漏回归。计划——后续版本补单测。
+- **3 条边界关键词仍误判**：现状——`查一下当前目录` / `跑一下测试` / `调用工具试试` 仍判 chat 档（NTR 4，分类器无此三条）。影响——这三句话首轮走 Chat，次轮才升 Work。计划——本版未修，后续补关键词。
+- **IM 往返未实现**：现状——群聊 work 档只写诊断日志，不实际发送消息（缺 dsh-im 运行环境）。影响——IM 里收不到路由提示消息。计划——留后续版本，需用户在设置页提供 botId/targetId 后另起时间盒。
+
+补充说明：同模型不同 effort（chat=light vs work=deep）也会真切，属预期行为；动态榜只取 `available` 模型，不可用条目静默跳过；移动端未做真机窄屏专项验证，设置页 UI 以桌面为准。
 
 ## 依赖与致谢
 
