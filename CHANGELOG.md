@@ -22,9 +22,9 @@
 - IM 往返两轮时间盒止损：降级为「默认 chat + classifyTask 关键词纠正」，first-turn.test P0-6 覆盖初始档，端到端未验证
 
 ### 已知问题
-- IM 消息往返（直投 + 选档重提）留后续版本：需用户在设置页提供 botId/targetId 后另起时间盒；或往 dev 装 dsh-im（需 pnpm add + 重启，另排期）
-- initialMode 承诺无独立用例（test/ 里 0 命中），promptOnWorkTool A/B 待转正式用例，留后续版本
-- 关键词覆盖不足：查一下当前目录/跑一下测试/调用工具试试 3 条边界仍误判 chat，次轮可升 work
+- issues NTR 5: IM 消息往返（直投 + 选档重提）留后续版本：需用户在设置页提供 botId/targetId 后另起时间盒；或往 dev 装 dsh-im（需 pnpm add + 重启，另排期）
+- issues NTR 6: initialMode 承诺无独立用例（test/ 里 0 命中），promptOnWorkTool A/B 待转正式用例，留后续版本
+- issues NTR 4（沿用 v0.8.6 口径，未动）: 关键词覆盖不足：查一下当前目录/跑一下测试/调用工具试试 3 条边界仍误判 chat，次轮可升 work
 
 ## v0.8.6.1-preview (2026-10-07，底线降级版)
 

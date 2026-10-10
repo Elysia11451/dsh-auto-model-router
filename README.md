@@ -80,9 +80,9 @@ dsh plugin --profile web exec auto-model-router.selftest
 
 ## 已知限制
 
-- **IM 首轮弹窗已降级（v0.8.7 现状）**：首轮 Chat/Work 弹窗仅在 DSH 主界面生效；IM 通道（QQ/微信/TG）走「默认 chat + classifyTask 关键词纠正」（`first-turn-im-default-chat` / `first-turn-im-keyword-work`），因 DSH 框架层 ask_user_question 在非 Web 通道挂起（Discussion #2544、#4708）。消息往返（直投 + 选档重提）留给后续版本，需用户在设置页提供 botId/targetId 后另起时间盒。
-- **首轮承诺未经独立用例验证（v0.8.7 缺口）**：首轮 ask 已派出、答案未回时本轮只注解不真切（`first-turn-pending`），initialMode 承诺（首轮选 Chat 永不自动升 Work）已在 `pre-step.js` / `pre-execute.js` / `prompt.js` 落地；但 test/ 里 `initialMode` 0 命中，无独立断言，留后续版本补（promptOnWorkTool A/B 转正式用例）。
-- **关键词覆盖不足**：`查一下当前目录`/`跑一下测试`/`调用工具试试` 3 条边界误判 chat 档，次轮可升 work（分类器 `AGENT_KEYWORDS` 无此三条，本版未改）。
+- **IM 首轮弹窗已降级（NTR 5，已知限制）**：首轮 Chat/Work 弹窗仅在 DSH 主界面生效；IM 通道（QQ/微信/TG）走「默认 chat + classifyTask 关键词纠正」（`first-turn-im-default-chat` / `first-turn-im-keyword-work`），因 DSH 框架层 ask_user_question 在非 Web 通道挂起（Discussion #2544、#4708）。消息往返（直投 + 选档重提）留给后续版本，需用户在设置页提供 botId/targetId 后另起时间盒。
+- **首轮承诺未经独立用例验证（NTR 6，已知限制）**：首轮 ask 已派出、答案未回时本轮只注解不真切（`first-turn-pending`，NTR 1 已修复行为），initialMode 承诺（首轮选 Chat 永不自动升 Work）已在 `pre-step.js` / `pre-execute.js` / `prompt.js` 落地；但 test/ 里 `initialMode` 0 命中，无独立断言，留后续版本补（promptOnWorkTool A/B 转正式用例）。
+- **关键词覆盖不足（NTR 4，已知限制，沿用 v0.8.6 口径）**：`查一下当前目录`/`跑一下测试`/`调用工具试试` 3 条边界误判 chat 档，次轮可升 work（分类器 `AGENT_KEYWORDS` 无此三条，本版未改）。
 - **推理档位三元组**：同类判定为 (provider, model, effort) 三元组，同模型不同 effort（chat=light vs work=deep）也会真切，属预期行为非 bug。
 - **可用性过滤**：动态榜仅取 `state==='available'` 的模型，不可用条目静默跳过；移动端未做真机窄屏专项验证，设置页 UI 以桌面为准。
 
