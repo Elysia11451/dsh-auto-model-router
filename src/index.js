@@ -33,8 +33,9 @@ import { createLeaderboardRefresh } from './leaderboard/impl/refresh.js';
 import { createCooldown } from './switch-controller/impl/cooldown.js';
 import { createSaveGuard } from './switch-controller/impl/save-guard.js';
 import { createRealSwitch } from './switch-controller/impl/real-switch.js';
-// first-turn：首轮模式建立与弹窗
+// first-turn：首轮模式建立与弹窗 + 待定留存（reject+steer 登记处）
 import { establishFirstTurnState } from './first-turn/impl/prompt.js';
+import { createPendingFirstTurnStore } from './first-turn/impl/pending-store.js';
 // telemetry：诊断落盘与升降档事件
 import { createRouteLog } from './telemetry/impl/route-log.js';
 import { createModeEventHandler } from './telemetry/impl/mode-event.js';
@@ -376,7 +377,7 @@ export function apply(ctx, config = {}) {
     ctx, cfg, flags, manualLock, lastSwitch, hintState, getService, safeLog,
     currentWorkModel, sidOf,
   });
-  const { annotateRoute, maybeGroupHint, routeBranch, knownWorkPairs } = decider;
+  const { annotateRoute, maybeGroupHint, routeBranch, knownWorkPairs, resolveWorkTarget } = decider;
 
   // ── switch-controller：真切咽喉（读回 / 手动保持 / 优先级 / 能不能切 / 真切）──
   const sw = createRealSwitch({
@@ -387,8 +388,22 @@ export function apply(ctx, config = {}) {
   });
   const { readSelectionProjection, readSelectionForRoute, manualKeepReason, applyPriorityMode, shouldSwitch, realSwitch } = sw;
 
+  // ── first-turn：首轮待定留存（reject+steer 登记处；有界 500，blocked 轮不泄漏）──
+  // v0.8.7.1 首轮拒绝+steer 重发：pre-step reject 登记 → settle 后 __redrive consume→真切→重发。
+  // 静态导入（apply 同步，不可用动态 import）；构造失败回退 null=旧行为（只注解不拒收）。
+  let pendingFirstTurn = null;
+  try {
+    pendingFirstTurn = createPendingFirstTurnStore();
+  } catch { pendingFirstTurn = null; }
   // ── first-turn：首轮状态建立与弹窗（isGroupMeta 属 routing-policy，经 deps 注入）──
-  const firstTurnDeps = { ctx, cfg, modeStore, getService, safeLog, isGroupMeta, classifyTask, appendRouteLog };
+  // chatTarget/resolveWorkTarget 来自 decider 实例（与 annotateRoute 同口径）；realSwitch 来自 switch-controller。
+  // createUserMessage：测试注入通道（config.createUserMessage 为函数时直传；生产走动态 import('@deepseek-ai/dsh-llm')）。
+  const firstTurnDeps = {
+    ctx, cfg, modeStore, getService, safeLog, isGroupMeta, classifyTask, appendRouteLog,
+    pendingFirstTurn, realSwitch, resolveWorkTarget,
+    chatTarget: decider.chatTarget,
+    createUserMessage: typeof getRaw('createUserMessage') === 'function' ? getRaw('createUserMessage') : null,
+  };
 
   // ── handlers：两条钩子主体 ──
   const preExecuteHandler = createPreExecuteHandler({
@@ -400,7 +415,7 @@ export function apply(ctx, config = {}) {
     ctx, cfg, flags, safeLog, sidOf, modeStore, peekSessionMode, lastSwitch,
     establishFirstTurnState, ensureFresh, annotateRoute, maybeGroupHint, routeBranch,
     readSelectionForRoute, applyPriorityMode, manualKeepReason, shouldSwitch, realSwitch,
-    appendRouteLog, firstTurnDeps,
+    appendRouteLog, firstTurnDeps, pendingFirstTurn,
   });
 
   try {

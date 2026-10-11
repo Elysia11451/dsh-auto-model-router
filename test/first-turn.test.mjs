@@ -162,13 +162,14 @@ await t('first-turn disabled -> no prompt, stays chat', async () => {
   });
 });
 
-// 7. v0.8.6 issues NTR 1: ask 已派出答案未回 → 首轮只注解不真切（keepReason=first-turn-pending，不调 selectModel）
-await t('v0.8.6 issues NTR 1: first-turn pending -> annotate-only (no switch)', async () => {
+// 7. v0.8.6 issues NTR 1（v0.8.7.1 已由 reject 语义取代：首轮待定 → {kind:'reject'} 零泄露，
+//    settle 后真切→steer 重发；本用例保留历史行为断言：reject 轮同样不调 selectModel + decision 打标）。
+await t('v0.8.6 issues NTR 1: first-turn pending -> reject (no switch)', async () => {
   await withTmpLog(async (readLines) => {
     // ask 永不 settle：模拟 IM 桥吞掉后悬挂
     const m = makeCtxUQ({ askImpl: () => new Promise(() => {}) });
     apply(m.ctx, { enableDynamicRanking: false });
-    await runStep(m.handlers, { text: '你好', sid: 'session-ft-w1-pending', turn: 1 });
+    const ret = await runStep(m.handlers, { text: '你好', sid: 'session-ft-w1-pending', turn: 1 });
     await sleep(80);
     assert.equal(m.askCount(), 1, 'ask must have been dispatched');
     assert.equal(m.calls.length, 0, 'pending round must not call selectModel');
@@ -177,6 +178,10 @@ await t('v0.8.6 issues NTR 1: first-turn pending -> annotate-only (no switch)', 
     assert.ok(d1, 'turn1 decision must exist');
     assert.equal(d1.keepReason, 'first-turn-pending', 'pending round keepReason must be first-turn-pending');
     assert.equal(d1.switched ?? null, null, 'pending round must not switch');
+    // v0.8.7.1：main 通道 + 生产装配（含 pendingFirstTurn）→ reject；旧脚手架 agent 无 steer 字段不影响 kind 断言。
+    // 注：makeCtxUQ 的 runStep 传 agent={session,source} 无 steer 方法 —— save 成功仍 reject（登记与否只看 save 返回）。
+    assert.equal(ret?.kind, 'reject', 'v0.8.7.1 pending round must reject (zero leak)');
+    assert.equal(d1.rejected, true, 'decision must carry rejected=true');
   });
 });
 
@@ -256,6 +261,172 @@ await t('v0.8.6.1: IM first-turn chat -> sync chat, no ask', async () => {
     const d1 = lines.find((l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-ft-im-chat');
     assert.ok(d1, 'turn1 decision must exist');
     assert.equal(d1.route, 'chat');
+  });
+});
+
+// ── v0.8.7.1 首轮拒绝+steer 重发（零泄露）6 用例 ──
+// 脚手架：带 live agent（steer 可观测）+ 工厂注入（createUserMessage 可断言）+ 真切可观测。
+function makeCtxReject({ askImpl = null, hasProvider = true } = {}) {
+  const base = makeCtxUQ({ askImpl, hasProvider });
+  const steered = [];
+  const switched = [];
+  const created = [];
+  const fakeAgent = (sid) => ({
+    session: sid,
+    source: {},
+    steer(msg) { steered.push(msg); },
+  });
+  // 包裹 sessionController.selectModel：记录真切目标（顺序断言用）
+  const origSelect = base.ctx.sessionController.selectModel.bind(base.ctx.sessionController);
+  base.ctx.sessionController.selectModel = async (payload) => {
+    switched.push({ ...payload, at: Date.now() });
+    return origSelect(payload);
+  };
+  return { ...base, steered, switched, created, fakeAgent };
+}
+const runStepWithAgent = (handlers, { text, sid, agent, meta = {}, turn = 1 }) =>
+  handlers['agent/pre-step']({
+    agent: agent ?? { session: sid, source: meta },
+    turn, step: 1,
+    messages: [{ role: 'user', content: [{ type: 'text', text }], source: { kind: 'user', rpcId: 'x-human-1' } }],
+  }, async () => ({ kind: 'allow' }));
+
+// 11. 首轮待定 → pre-step 返回 reject（零请求：selectModel 零调用）
+await t('v0.8.7.1: first-turn pending -> reject (zero switch)', async () => {
+  await withTmpLog(async (readLines) => {
+    const m = makeCtxReject({ askImpl: () => new Promise(() => {}) });
+    apply(m.ctx, {
+      enableDynamicRanking: false,
+      // createUserMessage 测试注入：经 config 直通（getRaw('createUserMessage')）
+      createUserMessage: (input) => { m.created.push(input); return { ...input, role: 'user', id: 'test-id-1' }; },
+    });
+    const agent = m.fakeAgent('session-rj-1');
+    const ret = await runStepWithAgent(m.handlers, { text: '你好', sid: 'session-rj-1', agent, turn: 1 });
+    await sleep(80);
+    assert.equal(ret?.kind, 'reject', 'pending round must return {kind:reject}');
+    assert.equal(m.calls.length, 0, 'reject round must not call selectModel');
+    assert.equal(m.steered.length, 0, 'no steer before settle');
+    const lines = await readLines();
+    const d1 = lines.find((l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-rj-1');
+    assert.ok(d1, 'turn1 decision must exist');
+    assert.equal(d1.keepReason, 'first-turn-pending');
+    assert.equal(d1.rejected, true, 'decision must carry rejected=true');
+  });
+});
+
+// 12. answered Work → steer 重发恰一次 + 目标为 work 档（顺序由 __redrive 代码保证：await realSwitch → steer）。
+// 注：单测桩的 sessionProjections 为空投影 → manualKeepReason 保守拦真切（selection-state-unreadable），
+// selectModel 零调用是正确行为；真切→重发的真实顺序由隔离验证（E 步 mock stream）覆盖。
+await t('v0.8.7.1: answered Work -> single steer redrive', async () => {
+  await withTmpLog(async (readLines) => {
+    let resolveAsk;
+    const m = makeCtxReject({ askImpl: () => new Promise((res) => { resolveAsk = res; }) });
+    const agent = m.fakeAgent('session-rj-work');
+    apply(m.ctx, {
+      enableDynamicRanking: false,
+      createUserMessage: (input) => ({ ...input, role: 'user', id: 'test-id-w' }),
+    });
+    await runStepWithAgent(m.handlers, { text: '你好', sid: 'session-rj-work', agent, turn: 1 });
+    resolveAsk({ answers: [{ selected: ['Work 档（能力模式）'] }] });
+    await sleep(150); // 等 __finish → __redrive（realSwitch 尝试 + steer）落地
+    assert.equal(m.steered.length, 1, 'answered must steer exactly once');
+    // 重建消息口径：content/source 沿用留存，role=user，新 id（官方 createUserMessage 语义）
+    assert.equal(m.steered[0]?.role, 'user');
+    assert.ok(String(m.steered[0]?.content?.[0]?.text ?? '').includes('你好'), 'redriven content must carry original text');
+    const lines = await readLines();
+    const rd = lines.find((l) => l.tool === 'first-turn/steer-redrive' && l.sid === 'session-rj-work');
+    assert.ok(rd, 'steer-redrive line must exist');
+    assert.equal(rd.mode, 'work');
+  });
+});
+
+// 13. 超时 → chat + steer（自超时路径同样重发）
+await t('v0.8.7.1: timeout -> chat + steer', async () => {
+  await withTmpLog(async (readLines) => {
+    const m = makeCtxReject({ askImpl: () => new Promise(() => {}) });
+    const agent = m.fakeAgent('session-rj-timeout');
+    apply(m.ctx, {
+      enableDynamicRanking: false,
+      firstTurnPromptTimeoutMs: 30, // 30ms + 1s 自超时垫 → 约 1s 后 settle
+      createUserMessage: (input) => ({ ...input, role: 'user', id: 'test-id-t' }),
+    });
+    await runStepWithAgent(m.handlers, { text: '你好', sid: 'session-rj-timeout', agent, turn: 1 });
+    await sleep(1400); // 等自超时 __finish → __redrive
+    assert.equal(m.steered.length, 1, 'timeout must steer exactly once');
+    const lines = await readLines();
+    const st = lines.find((l) => l.tool === 'first-turn/prompt-settled' && l.sid === 'session-rj-timeout');
+    assert.ok(st, 'settled line must exist');
+    const rd = lines.find((l) => l.tool === 'first-turn/steer-redrive' && l.sid === 'session-rj-timeout');
+    assert.ok(rd, 'steer-redrive line must exist');
+    assert.equal(rd.mode, 'chat');
+  });
+});
+
+// 14. 竞速：answer 与自超时双到 → steer 只发一次（__settled 旗）
+await t('v0.8.7.1: answer vs timeout race -> single steer', async () => {
+  await withTmpLog(async () => {
+    let resolveAsk;
+    const m = makeCtxReject({ askImpl: () => new Promise((res) => { resolveAsk = res; }) });
+    const agent = m.fakeAgent('session-rj-race');
+    apply(m.ctx, {
+      enableDynamicRanking: false,
+      firstTurnPromptTimeoutMs: 30,
+      createUserMessage: (input) => ({ ...input, role: 'user', id: 'test-id-r' }),
+    });
+    await runStepWithAgent(m.handlers, { text: '你好', sid: 'session-rj-race', agent, turn: 1 });
+    // 自超时前先答（answered 赢），再让自超时触发（迟到应被 __settled 拦下）
+    resolveAsk({ answers: [{ selected: ['Chat 档（省钱模式）'] }] });
+    await sleep(1400);
+    assert.equal(m.steered.length, 1, 'race must steer exactly once');
+  });
+});
+
+// 15. 重发后第二轮 pre-step 不再 pending（settle 已写 modeStore）
+await t('v0.8.7.1: redriven second round -> no pending', async () => {
+  await withTmpLog(async (readLines) => {
+    let resolveAsk;
+    const m = makeCtxReject({ askImpl: () => new Promise((res) => { resolveAsk = res; }) });
+    const agent = m.fakeAgent('session-rj-2nd');
+    apply(m.ctx, {
+      enableDynamicRanking: false,
+      createUserMessage: (input) => ({ ...input, role: 'user', id: 'test-id-2' }),
+    });
+    await runStepWithAgent(m.handlers, { text: '你好', sid: 'session-rj-2nd', agent, turn: 1 });
+    resolveAsk({ answers: [{ selected: ['Chat 档（省钱模式）'] }] });
+    await sleep(150);
+    const ret2 = await runStepWithAgent(m.handlers, { text: '你好', sid: 'session-rj-2nd', agent, turn: 2 });
+    await sleep(50);
+    assert.notEqual(ret2?.kind, 'reject', 'second round must not reject');
+    const lines = await readLines();
+    const d2 = lines.find((l) => l.tool === 'agent/pre-step/decision' && l.sid === 'session-rj-2nd' && l.turn === 2);
+    assert.ok(d2, 'turn2 decision must exist');
+    assert.notEqual(d2.keepReason, 'first-turn-pending', 'second round must not be pending');
+  });
+});
+
+// 16. 异常路径永不进 reject：NO_PROVIDER / child-agent（无 agent 字段降级）/ IM / 群聊 / 关闭弹窗
+await t('v0.8.7.1: abnormal paths never reject', async () => {
+  await withTmpLog(async () => {
+    // a) NO_PROVIDER：无 userQuestions 服务 → 同步定档，firstTurnPending=false
+    const m1 = makeCtxReject({ hasProvider: false });
+    apply(m1.ctx, { enableDynamicRanking: false });
+    const r1 = await runStep(m1.handlers, { text: '你好', sid: 'session-rj-nop', turn: 1 });
+    assert.notEqual(r1?.kind, 'reject', 'no-provider must not reject');
+    // b) IM：关键词同步定档，不经过 ask
+    const m2 = makeCtxReject({ askImpl: () => new Promise(() => {}) });
+    apply(m2.ctx, { enableDynamicRanking: false });
+    const r2 = await runStepIM(m2.handlers, { text: '你好', sid: 'session-rj-im', turn: 1 });
+    assert.notEqual(r2?.kind, 'reject', 'IM must not reject');
+    // c) 群聊：默认 chat 不弹窗
+    const m3 = makeCtxReject({ askImpl: () => new Promise(() => {}) });
+    apply(m3.ctx, { enableDynamicRanking: false });
+    const r3 = await runStep(m3.handlers, { text: '你好', sid: 'session-rj-group', meta: { channel: 'qq', chatType: 'group' }, turn: 1 });
+    assert.notEqual(r3?.kind, 'reject', 'group must not reject');
+    // d) 关闭弹窗：默认 chat 不弹窗
+    const m4 = makeCtxReject({ askImpl: () => new Promise(() => {}) });
+    apply(m4.ctx, { enableDynamicRanking: false, firstTurnPrompt: false });
+    const r4 = await runStep(m4.handlers, { text: '你好', sid: 'session-rj-off', turn: 1 });
+    assert.notEqual(r4?.kind, 'reject', 'disabled prompt must not reject');
   });
 });
 

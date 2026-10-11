@@ -7,7 +7,7 @@
 //
 // 拆分铁律：本文件不 import 本域 interface.js；跨域（first-turn / leaderboard /
 // switch-controller / telemetry）一律经 deps 注入。域内纯函数直接 import 同域 impl。
-import { extractUserText, hasPendingToolCalls, textSig, classifyTask, isGroupMeta, sourceFromMeta } from './classifier.js';
+import { extractUserText, hasPendingToolCalls, textSig, classifyTask, isGroupMeta, sourceFromMeta, isHumanInput } from './classifier.js';
 import { decideRoute, nextSessionMode } from './decider.js';
 
 /**
@@ -39,7 +39,7 @@ export function createPreStepHandler(d) {
     ctx, cfg, flags, safeLog, sidOf, modeStore, peekSessionMode, lastSwitch,
     establishFirstTurnState, ensureFresh, annotateRoute, maybeGroupHint, routeBranch,
     readSelectionForRoute, applyPriorityMode, manualKeepReason, shouldSwitch, realSwitch,
-    appendRouteLog, firstTurnDeps,
+    appendRouteLog, firstTurnDeps, pendingFirstTurn,
   } = d;
 
   const stepRouted = new Map(); // sid|turn|textSig -> 已路由时间戳（同一轮只判一次）
@@ -231,6 +231,8 @@ export function createPreStepHandler(d) {
       // 真切：与 pre-execute 同一套短路（手动优先 / 同类保留）。
       // 差别只有一处：这里 await + 1500ms 上限，让选择在本步 prompt 组装前落定；
       // fire-and-forget 会与组装赛跑，纯聊天轮极易读不到新选择。
+      // v0.8.7.1：pendingReject 旗——reject 必须等 decision 落盘后再返回（旧测试按 decision 行断言）。
+      let __pendingReject = false;
       try {
         const target = holder?.autoModelRouter?.target;
         const origTargetStr = target ? `${target.provider}/${target.model}/${target.effort ?? '-'}` : null;
@@ -247,6 +249,32 @@ export function createPreStepHandler(d) {
           holder.autoModelRouter.target = null;
           holder.autoModelRouter.keepReason = 'first-turn-pending';
           safeLog(ctx, 'info', `pre-step skip switch for ${sid} (reason=first-turn-pending; prompt answer unsettled, annotate-only this round).`);
+          // v0.8.7.1 首轮拒绝+steer 重发（零泄露）：ask 实际派出（pendingStore 缺席=旧行为只注解）。
+          // 登记成功 → 返回 {kind:'reject'}（宿主实锤：blocked + 0 step + 无请求头；
+          // AGENT_CONTRACT.md §2）。settle 回调（prompt.js __finish）负责 realSwitch→steer 重发。
+          // 约束：steer 不在 handler 内调用（Discussion #232：pre-step await 窗口内投递会被静默丢弃）。
+          if (pendingFirstTurn && typeof pendingFirstTurn.save === 'function') {
+            try {
+              const claimed = Array.isArray(msgs) ? msgs.find((m) => m && isHumanInput(m) && String(m?.role ?? '') === 'user') ?? msgs[msgs.length - 1] : null;
+              const saved = claimed ? pendingFirstTurn.save(sid, { content: claimed.content, source: claimed.source }) : false;
+              try {
+                appendRouteLog({
+                  sid,
+                  tool: 'agent/pre-step/reject',
+                  extractText: String(text).slice(0, 300),
+                  task: route?.task ?? '',
+                  route: route?.mode ?? '',
+                  target: origTargetStr,
+                  keepReason: 'first-turn-pending',
+                  rejected: saved === true,
+                  turn: payload?.turn ?? null,
+                  step: payload?.step ?? null,
+                }).catch(() => {});
+              } catch { /* 诊断失败不阻断 */ }
+              // decision 行在下方统一落盘后再返回 reject（不断言缺失）。
+              if (saved === true) __pendingReject = true;
+            } catch { /* 登记失败回退只注解放行 */ }
+          }
         } else if (target && sid && sid !== 'unknown' && flags.freeModelOk !== false) {
           let keep = null;
           try { keep = applyPriorityMode(manualKeepReason(sid, null, route?.mode ?? ''), sid, 'pre-step'); } catch { keep = null; }
@@ -299,9 +327,11 @@ export function createPreStepHandler(d) {
             chatTurns: dms?.chatTurns ?? null,
           };
           try { decision.actualSel = readSelectionForRoute(sid); } catch { decision.actualSel = null; }
+          if (__pendingReject) decision.rejected = true; // v0.8.7.1：reject 轮在 decision 行打标
           appendRouteLog(decision).catch(() => {});
         } catch { /* 诊断失败不阻断 */ }
       } catch { /* 真切失败不影响放行 */ }
+      if (__pendingReject) return { kind: 'reject' };
       return await next();
     } catch (err) {
       try {

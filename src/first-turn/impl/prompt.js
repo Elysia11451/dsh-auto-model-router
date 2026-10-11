@@ -22,6 +22,11 @@ import { createAskTimeout, askErrorReason } from './timing.js';
  * @property {(ctx: object, level: string, msg: string) => void} safeLog
  * @property {(meta: object) => boolean} isGroupMeta —— 跨域注入（routing-policy）
  * @property {(entry: object) => Promise<void>} [appendRouteLog] —— 跨域注入（telemetry，可缺省）
+ * @property {{save: Function, peek: Function, has: Function, consume: Function, delete: Function}} [pendingFirstTurn] —— 首轮待定留存（first-turn/pending-store，pre-step reject 登记处；缺省=不重发）
+ * @property {Function} [realSwitch] —— 跨域注入（switch-controller）：settle 后先真切再重发
+ * @property {Function} [chatTarget] —— 跨域注入（routing-policy/decider 实例）：chat 档目标解析
+ * @property {Function} [currentWorkModel] —— 跨域注入（leaderboard）：work 档动态最强（裸模型名）
+ * @property {Function} [createUserMessage] —— 消息工厂（测试注入；缺省走动态 import('@deepseek-ai/dsh-llm')）
  */
 
 /**
@@ -38,7 +43,7 @@ import { createAskTimeout, askErrorReason } from './timing.js';
  *   其余一切路径（群默认/关闭/无 provider/同步失败）均为 false。
  */
 export function establishFirstTurnState(o, d) {
-  const { ctx, cfg, modeStore, getService, safeLog, isGroupMeta, appendRouteLog, classifyTask } = d;
+  const { ctx, cfg, modeStore, getService, safeLog, isGroupMeta, appendRouteLog, classifyTask, pendingFirstTurn, realSwitch, chatTarget, currentWorkModel, resolveWorkTarget, createUserMessage } = d;
   const { sid, meta, agent, text = '', source = '' } = o;
   // 已有记录的 sid 直接跳过弹窗（老会话误弹修复：pre-step read  miss 后的二次保险）
   try {
@@ -157,6 +162,83 @@ export function establishFirstTurnState(o, d) {
     // 先落定者赢、迟到答案不再覆盖（与"超时后 abort 拒收"语义一致）。
     let __settled = false;
     let __selfTimer = null;
+    // v0.8.7.1 首轮拒绝+steer 重发：settle 后先真切（await realSwitch）再重发留存消息。
+    // 顺序铁律：realSwitch 落定 → 再 steer（否则重发 turn 的 assemble 快照仍是旧模型）。
+    // 防重：__settled 旗（answer/timeout 双到只发一次）+ consume 原子取走（重发后删条目）。
+    const __redrive = async (mode) => {
+      try {
+        if (!pendingFirstTurn || typeof pendingFirstTurn.consume !== 'function') return;
+        const kept = pendingFirstTurn.consume(sid);
+        if (!kept) return; // 未登记（旧行为只注解放行 / 异常路径）→ 无需重发
+        // 目标解析（与 annotateRoute 同口径，不自创逻辑）：
+        //   work → resolveWorkTarget()（manual 锁优先 + 动态最强 + 回退，decider 实例内已含）；
+        //   chat/timeout/reject → chatTarget()（owned-default + 手动/链头 + 回退）。
+        // 注入缺席（旧单测/旧装配）→ target=null，只重发不真切（消息不丢）。
+        let target = null;
+        try {
+          if (mode === 'work') {
+            if (typeof resolveWorkTarget === 'function') {
+              const w = resolveWorkTarget();
+              if (w?.provider && w?.model) target = { provider: w.provider, model: w.model, effort: cfg?.workEffort };
+            } else if (typeof currentWorkModel === 'function') {
+              // 兼容旧装配：currentWorkModel() 返回裸模型名 → 配 workProvider。
+              const m = String(currentWorkModel() ?? '').trim();
+              if (m) {
+                const slash = m.indexOf('/');
+                target = slash > 0
+                  ? { provider: m.slice(0, slash), model: m.slice(slash + 1), effort: cfg?.workEffort }
+                  : { provider: cfg?.workProvider, model: m, effort: cfg?.workEffort };
+              }
+            }
+          } else {
+            const ct = typeof chatTarget === 'function' ? chatTarget() : null;
+            if (ct?.provider && ct?.model) target = { provider: ct.provider, model: ct.model, effort: cfg?.chatEffort };
+          }
+        } catch { target = null; }
+        // 真机验证：记录真切→重发顺序时间戳（orderOk=true 即 realSwitch 先于 steer）。
+        let realSwitchStart = null;
+        let realSwitchEnd = null;
+        if (target && typeof realSwitch === 'function') {
+          try {
+            realSwitchStart = Date.now();
+            await realSwitch(sid, target, mode);
+            realSwitchEnd = Date.now();
+          } catch { if (realSwitchEnd === null) realSwitchEnd = Date.now(); /* 真切失败仍重发（模型不对但消息不丢） */ }
+        }
+        // 消息重建：官方唯一口径 createUserMessage（新 id + deepFreeze；旧冻结对象不可复用）。
+        // 工厂来源：测试注入 > 动态 import('@deepseek-ai/dsh-llm')；双双缺席 → 只真切不重发（消息不丢：用户可再发一条）。
+        let factory = typeof createUserMessage === 'function' ? createUserMessage : null;
+        if (!factory) {
+          try {
+            const llmMod = await import('@deepseek-ai/dsh-llm');
+            if (typeof llmMod?.createUserMessage === 'function') factory = llmMod.createUserMessage;
+          } catch { factory = null; }
+        }
+        // 工厂缺席（动态 import('@deepseek-ai/dsh-llm') 失败，极小概率）：
+        // 只真切不重发。已知代价：首轮消息可能丢失，用户需重发。极端场景，不额外处理。
+        if (typeof factory !== 'function') return;
+        let msg = null;
+        try {
+          msg = factory({ content: kept.content, source: kept.source });
+        } catch { msg = null; }
+        if (!msg || !agent || typeof agent.steer !== 'function') return;
+        try {
+          const steerTs = Date.now();
+          agent.steer(msg);
+          logJsonl({ sid, tool: 'first-turn/steer-redrive', mode, redriven: true });
+          // 真机验证行：realSwitch→steer 顺序断言（缺席=未真切，orderOk=null 不判）。
+          try {
+            logJsonl({
+              sid, tool: 'steer-redrive-order', mode,
+              realSwitchStart, realSwitchEnd, steerTs,
+              orderOk: (realSwitchStart !== null && realSwitchEnd !== null) ? (realSwitchEnd <= steerTs) : null,
+            });
+          } catch { /* 顺序行失败不阻断 */ }
+        } catch (err) {
+          try { safeLog(ctx, 'warn', `first-turn steer redrive failed for session ${sid}: ${String(err?.message ?? err)}`); } catch { /* noop */ }
+        }
+      } catch { /* 重发失败不阻断（settle 状态已落定） */ }
+    };
     const __finish = (mode, reason, msg, level, extra) => {
       if (__settled) return;
       __settled = true;
@@ -192,6 +274,9 @@ export function establishFirstTurnState(o, d) {
       } catch { /* 探针失败不阻断 */ }
       try { safeLog(ctx, level, msg); } catch { /* noop */ }
       logJsonl({ sid, tool: 'first-turn/prompt-settled', mode, reason, ...(extra || {}) });
+      // v0.8.7.1 首轮拒绝+steer 重发：settle 落定后，fire-and-forget 触发真切→重发。
+      // __settled 旗已保证单次；__finish 自身保持同步（调用方 fire-and-forget 语义不变）。
+      try { Promise.resolve(__redrive(mode)).catch(() => {}); } catch { /* 重发失败不阻断 */ }
     };
     try {
       __selfTimer = setTimeout(() => {
@@ -209,7 +294,7 @@ export function establishFirstTurnState(o, d) {
     } catch { /* 自超时挂失败不阻断（signal 超时仍在） */ }
     asked = true; // ask 即将派出：本轮 firstTurnPending=true，调用方只注解不真切（issues NTR 1）
     __svc.ask(__req).then((ans) => {
-      if (__settled) return; // 自超时已先落定，迟到答案不再覆盖
+      if (__settled) return; // 自超时已先落定，迟到答案不再覆盖（v0.8.7.1：steer 只发一次）
       let selected = '';
       try { selected = ans?.answers?.[0]?.selected?.[0] ?? ans?.answers?.[0]?.answer ?? ''; } catch { selected = ''; }
       if (String(selected).includes('Work')) {

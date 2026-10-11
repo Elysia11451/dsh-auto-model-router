@@ -1,6 +1,6 @@
 {
   "name": "dsh-auto-model-router",
-  "version": "0.8.7",
+  "version": "0.8.7.1",
   "description": "DSH 插件，自动路由 Chat/Work 模型，支持免费池降级",
   "repository": "https://github.com/Elysia11451/dsh-auto-model-router",
   "author": "Elysia11451",

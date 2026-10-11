@@ -423,5 +423,20 @@ export function buildSelectModelPayload({ sessionId, provider, model, effort }) 
     } catch { /* 提示失败不影响放行 */ }
   }
 
-  return { knownWorkPairs, routeBranch, chatTarget, ownedDefaultTarget, annotateRoute, maybeGroupHint };
+  // v0.8.7.1 首轮拒绝+steer 重发：work 档目标解析出口（与 annotateRoute 同口径：
+  // manual 锁优先，否则 workProvider + currentWorkModel()）。settle 后真切用，不自创逻辑。
+  function resolveWorkTarget(modelOverride) {
+    try {
+      if (manualLock.on && manualLock.provider && manualLock.model) {
+        return { provider: manualLock.provider, model: manualLock.model };
+      }
+      const m = String(modelOverride || (typeof currentWorkModel === 'function' ? currentWorkModel() : '') || '').trim();
+      if (!m) return { provider: '', model: '' };
+      const slash = m.indexOf('/');
+      if (slash > 0 && slash < m.length - 1) return { provider: m.slice(0, slash), model: m.slice(slash + 1) };
+      return { provider: String(cfg?.workProvider ?? ''), model: m };
+    } catch { return { provider: '', model: '' }; }
+  }
+
+  return { knownWorkPairs, routeBranch, chatTarget, ownedDefaultTarget, annotateRoute, maybeGroupHint, resolveWorkTarget };
 }
