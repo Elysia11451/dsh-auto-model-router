@@ -83,9 +83,9 @@ export const Config = Schema.object({
   chatModelPriority: Schema.array(Schema.string()).default([]).volatile()
     .description({ zh: '仅自动模式生效。请填入你自己的 API 模型，格式 provider/model，按成本从低到高排序。留空则回退免费池并打警告', en: 'Only used in auto mode. Fill in your own API models as provider/model, cheapest first. Empty falls back to the free pool with a warning' }),
   // —— 分组 D · 群聊（默认折叠，高级）——
-  enableGroupHint: Schema.boolean().default(false).volatile()
+  enableGroupHint: Schema.boolean().default(false).hidden(true)
     .description({ zh: '群聊 work 档「诊断日志」开关（v0.8.7 P0-3）：只写一条诊断日志到路由日志，不向群聊发送任何消息。默认关；开后进入 work 档的群聊会话每冷却周期记一条日志', en: 'Group work-model diagnostic LOG switch (v0.8.7 P0-3): writes one diagnostic line to the route log only, sends no message to the group. Off by default' }),
-  hintCooldownMs: Schema.number().default(300000).volatile()
+  hintCooldownMs: Schema.number().default(300000).hidden(true)
     .description({ zh: '提示冷却（毫秒）。群聊提示发一次后多久内不再发', en: 'Hint cooldown in ms' }),
   // —— 分组 E · 状态机（默认折叠，高级）——
   switchCooldownMs: Schema.number().default(5000).volatile()
